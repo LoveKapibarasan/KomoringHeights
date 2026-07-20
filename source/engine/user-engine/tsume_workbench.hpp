@@ -494,8 +494,7 @@ inline WorkRecord MakeRecord(Position& pos, const std::string& normalized_sfen,
   r.verification = std::move(verification);
   r.perfect = r.verification.complete && r.verification.proof == Proof::kMate && r.verification.unique &&
               !r.verification.shorter_mate && !r.verification.piece_surplus &&
-              !r.verification.unnecessary_piece && !r.verification.futile_interposition &&
-              !r.verification.prohibited_move;
+              !r.verification.unnecessary_piece && !r.verification.prohibited_move;
   const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
   std::tm tm{};
 #if defined(_WIN32)
