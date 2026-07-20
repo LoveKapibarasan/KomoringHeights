@@ -52,6 +52,12 @@ inline std::string ValidateTsumePosition(const Position& pos) {
   if (pos.king_square(them) == SQ_NB) {
     return "受け方の玉が盤上にありません";
   }
+  // The diagram is the position immediately before Black's first checking
+  // move.  Feeding an already checked White king to CHECKS_ALL violates that
+  // generator's precondition and is not a valid tsume diagram.
+  if (pos.effected_to(us, pos.king_square(them))) {
+    return "出題局面ですでに玉方玉へ王手がかかっています";
+  }
 
   // 出題局面で攻め方に王手がかかっていてはならない
   // （玉方手番の局面は「受け方から始まる詰将棋」であり通常形式ではない）

@@ -63,6 +63,7 @@ struct VerifyResult {
   bool repetition{false};
   bool illegal_intended{false};
   bool intended_mismatch{false};
+  bool symmetric_solutions_collapsed{false};
   bool piece_surplus{false};
   bool unnecessary_piece{false};
   bool futile_interposition{false};
@@ -192,6 +193,21 @@ inline std::string HandSfen(Hand hand, bool lower) {
   return out.empty() ? "-" : out;
 }
 
+inline bool IsMirrorSymmetric(const Position& pos) {
+  for (int s = 0; s < SQ_NB; ++s) {
+    const Square sq = static_cast<Square>(s);
+    if (pos.piece_on(sq) != pos.piece_on(Mir(sq))) return false;
+  }
+  return true;
+}
+
+inline std::string MirrorUsi(std::string move) {
+  auto mirror_file = [](char c) { return static_cast<char>('0' + (10 - (c - '0'))); };
+  if (move.size() >= 4 && move[1] == '*') move[2] = mirror_file(move[2]);
+  else if (move.size() >= 4) { move[0] = mirror_file(move[0]); move[2] = mirror_file(move[2]); }
+  return move;
+}
+
 }  // namespace detail
 
 class ExhaustiveVerifier {
@@ -231,8 +247,17 @@ class ExhaustiveVerifier {
       result_.futile_interposition |= child.futile_interposition;
       if (child.proof == Proof::kNoMate) result_.no_mate_branch = true;
     }
-    for (const auto& b : result_.attacks)
-      if (b.proof == Proof::kMate && b.mate_ply == result_.mate_ply) ++mating_attacks;
+    std::unordered_set<std::string> solution_classes;
+    const bool mirror_symmetric = detail::IsMirrorSymmetric(pos);
+    for (const auto& b : result_.attacks) if (b.proof == Proof::kMate && b.mate_ply == result_.mate_ply) {
+      std::string move = USI::move(b.move);
+      if (mirror_symmetric) move = std::min(move, detail::MirrorUsi(move));
+      solution_classes.insert(std::move(move));
+    }
+    mating_attacks = static_cast<int>(solution_classes.size());
+    result_.symmetric_solutions_collapsed = mirror_symmetric &&
+        solution_classes.size() < static_cast<std::size_t>(std::count_if(result_.attacks.begin(), result_.attacks.end(),
+            [&](const Branch& b) { return b.proof == Proof::kMate && b.mate_ply == result_.mate_ply; }));
     result_.alternative_mate = mating_attacks > 1;
     result_.shorter_mate = result_.mate_ply >= 0 && shortest < result_.mate_ply;
     result_.unique = result_.complete && result_.proof == Proof::kMate && mating_attacks == 1;
@@ -368,6 +393,7 @@ class ExhaustiveVerifier {
     if (result_.proof == Proof::kMate) result_.reasons.push_back("all replies on the principal AND branches are mated");
     if (result_.proof == Proof::kNoMate) result_.reasons.push_back("no forced mate exists within the requested ply bound");
     if (result_.alternative_mate) result_.reasons.push_back("multiple root checking moves force mate (alternative solution)");
+    if (result_.symmetric_solutions_collapsed) result_.reasons.push_back("mirror-equivalent root moves were treated as one solution");
     if (result_.repetition) result_.reasons.push_back("a checking sequence repeats and is a failure for the attacker");
     if (result_.illegal_intended) result_.reasons.push_back("the supplied intended line contains an illegal or non-checking attack");
     if (result_.intended_mismatch) result_.reasons.push_back("the supplied intended line differs from the shortest/longest principal line");
@@ -533,6 +559,7 @@ inline std::string ToJson(const WorkRecord& r, Position& root) {
     << ",\"repetition\":" << (r.verification.repetition ? "true" : "false")
     << ",\"prohibitedMove\":" << (r.verification.prohibited_move ? "true" : "false")
     << ",\"intendedMismatch\":" << (r.verification.intended_mismatch ? "true" : "false")
+    << ",\"symmetricSolutionsCollapsed\":" << (r.verification.symmetric_solutions_collapsed ? "true" : "false")
     << ",\"nodes\":" << r.verification.nodes << ",\"maxPly\":" << r.conditions.max_ply
     << ",\"maxNodes\":" << r.conditions.max_nodes << ",\"generatedAt\":\"" << r.generated_at << "\",";
   o << "\"scores\":{"; WriteScores(o, r.scores); o << "},\"techniques\":[";
