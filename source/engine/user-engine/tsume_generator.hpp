@@ -136,8 +136,12 @@ inline std::string GenerateCandidateSfen(std::mt19937& rng, int target_moves = 3
   std::uniform_int_distribution<int> rank_dist(0, 8);
   std::uniform_int_distribution<int> file_dist(0, 8);
 
-  const int king_rank = rank_dist(rng);
-  const int king_file = file_dist(rng);
+  // Edge kings produce substantially more composition-like mating nets than
+  // uniform full-board sampling. Keep a minority of central positions so the
+  // generator is not restricted to corner templates.
+  std::bernoulli_distribution edge_bias(0.75);
+  const int king_rank = edge_bias(rng) ? static_cast<int>(rng() % 3) : rank_dist(rng);
+  const int king_file = edge_bias(rng) ? static_cast<int>(rng() % 3) : file_dist(rng);
   board[king_rank][king_file] = 'k';
 
   // 目標手数に応じた攻め方の駒数
@@ -199,6 +203,40 @@ inline std::string GenerateCandidateSfen(std::mt19937& rng, int target_moves = 3
     }
 
     ++used_count[piece_idx];
+  }
+
+  // Add a small number of generated defender pieces around the king.  Purely
+  // sparse attacker-only positions leave almost every escape and interposition
+  // available and very rarely survive uniqueness/full-width verification.
+  // These pieces are part of the same random construction (not a library seed)
+  // and are charged against the physical 39-piece set below.
+  const int max_defenders = target_moves >= 7 ? 3 : 1;
+  std::uniform_int_distribution<int> defender_count_dist(0, max_defenders);
+  std::uniform_int_distribution<int> defender_type_dist(0, 4);  // P,L,N,S,G
+  const int defender_count = defender_count_dist(rng);
+  for (int i = 0; i < defender_count; ++i) {
+    int piece_idx = -1;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+      const int idx = defender_type_dist(rng);
+      if (used_count[idx] < kPieceMaxTotal[idx]) { piece_idx = idx; break; }
+    }
+    if (piece_idx < 0) continue;
+
+    const char piece = static_cast<char>(std::tolower(
+        static_cast<unsigned char>(kPieceChars[piece_idx])));
+    bool placed = false;
+    for (int attempt = 0; attempt < 40 && !placed; ++attempt) {
+      const int r = std::max(0, std::min(8, king_rank + static_cast<int>(rng() % 7) - 3));
+      const int f = std::max(0, std::min(8, king_file + static_cast<int>(rng() % 7) - 3));
+      if (board[r][f] != '.') continue;
+      // White pawns/lances cannot remain on rank 9; white knights cannot
+      // remain on ranks 8 or 9.
+      if ((piece == 'p' || piece == 'l') && r == 8) continue;
+      if (piece == 'n' && r >= 7) continue;
+      board[r][f] = piece;
+      placed = true;
+    }
+    if (placed) ++used_count[piece_idx];
   }
 
   // 残り駒を受け方持ち駒に割り当て（40枚完全使用: 攻め方未使用分を受け方持ち駒へ）

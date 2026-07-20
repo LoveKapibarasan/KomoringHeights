@@ -353,8 +353,14 @@ void GenerateProblemsForMoves(int target_moves, int count,
         for (const auto& m : best_moves) sol.push_back(USI::move(m));
         komori::TsumeGeneratedProblem problem{sfen, mate_in, sol, ""};
 
-        // 手数伸ばし: 小さい変形で長い詰みが生まれるか試みる
-        problem = TryExtendMateLen(problem, target_moves + 10, rng, time_limit_ms);
+        // 目標手数の生候補を失わないよう、延長より先に完全検証する。
+        // 従来は未検証の延長候補で元の9手候補を上書きしていた。
+        sync_cout << "info string [raw candidate] " << mate_in << " ply: " << sfen << sync_endl;
+        if (komori::tsume::HasSurplusAttackerHand(gen_pos, best_moves)) {
+          sync_cout << "info string [candidate rejected] df-pn principal leaves surplus attacker hand"
+                    << sync_endl;
+          continue;
+        }
 
         // 邪魔駒確認: 不要な駒を除去して局面を簡潔に
         problem = RemoveUnnecessaryPieces(problem, time_limit_ms);
@@ -362,19 +368,30 @@ void GenerateProblemsForMoves(int target_moves, int count,
         // df-pnで見つかった候補を作品検査用の全幅AND/OR探索で再検証する。
         komori::tsume::VerifyOptions verify_options;
         verify_options.max_ply = problem.mate_in;
-        verify_options.max_nodes = std::max<std::uint64_t>(5'000'000,
+        verify_options.max_nodes = std::max<std::uint64_t>(20'000'000,
             komori::detail::ComputeNodesLimit(problem.mate_in));
         verify_options.double_king = false;
         Position candidate; StateListPtr candidate_states(new StateList(1));
         candidate.set(problem.sfen, &candidate_states->back(), Threads.main());
         komori::tsume::ExhaustiveVerifier complete_verifier(verify_options);
         auto complete_result = complete_verifier.Run(candidate);
+        const bool surplus = komori::tsume::HasSurplusAttackerHand(candidate, complete_result.principal);
         if (!complete_result.complete || complete_result.proof != komori::tsume::Proof::kMate ||
-            !complete_result.unique || complete_result.mate_ply != problem.mate_in ||
-            komori::tsume::HasSurplusAttackerHand(candidate, complete_result.principal)) continue;
+            !complete_result.unique || complete_result.mate_ply != problem.mate_in || surplus) {
+          sync_cout << "info string [candidate rejected] nodes=" << complete_result.nodes
+                    << " complete=" << complete_result.complete
+                    << " mate=" << (complete_result.proof == komori::tsume::Proof::kMate)
+                    << " unique=" << complete_result.unique
+                    << " matePly=" << complete_result.mate_ply
+                    << " surplus=" << surplus << sync_endl;
+          continue;
+        }
 
         AnalyzeUnnecessaryPieces(problem.sfen, verify_options, complete_result);
-        if (complete_result.unnecessary_piece) continue;
+        if (complete_result.unnecessary_piece) {
+          sync_cout << "info string [candidate rejected] unnecessary piece" << sync_endl;
+          continue;
+        }
         problem.sfen = CanonicalizeVerified(problem.sfen, verify_options, complete_result);
 
         Position normalized; StateListPtr normalized_states(new StateList(1));

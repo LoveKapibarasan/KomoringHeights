@@ -193,6 +193,30 @@ inline std::string HandSfen(Hand hand, bool lower) {
   return out.empty() ? "-" : out;
 }
 
+inline std::string NormalizeSfenHandText(const std::string& sfen) {
+  std::istringstream in(sfen);
+  std::string board, turn, hand, move_no;
+  if (!(in >> board >> turn >> hand >> move_no) || hand == "-") return sfen;
+  const std::string order = "RBGSNLPrbgsnlp";
+  std::array<int, 14> counts{};
+  for (std::size_t i = 0; i < hand.size();) {
+    int n = 0;
+    while (i < hand.size() && std::isdigit(static_cast<unsigned char>(hand[i])))
+      n = n * 10 + (hand[i++] - '0');
+    if (i >= hand.size()) return sfen;
+    const auto at = order.find(hand[i++]);
+    if (at == std::string::npos) return sfen;
+    counts[at] += n == 0 ? 1 : n;
+  }
+  std::string normalized;
+  for (std::size_t i = 0; i < order.size(); ++i) {
+    if (counts[i] == 0) continue;
+    if (counts[i] > 1) normalized += std::to_string(counts[i]);
+    normalized += order[i];
+  }
+  return board + " " + turn + " " + (normalized.empty() ? "-" : normalized) + " " + move_no;
+}
+
 inline bool IsMirrorSymmetric(const Position& pos) {
   for (int s = 0; s < SQ_NB; ++s) {
     const Square sq = static_cast<Square>(s);
@@ -481,7 +505,8 @@ inline WorkRecord MakeRecord(Position& pos, const std::string& normalized_sfen,
                              const VerifyOptions& options, VerifyResult verification,
                              const std::string& parent_id = "") {
   WorkRecord r;
-  r.sfen = pos.sfen(); r.normalized_sfen = normalized_sfen.empty() ? r.sfen : normalized_sfen;
+  r.sfen = pos.sfen();
+  r.normalized_sfen = detail::NormalizeSfenHandText(normalized_sfen.empty() ? r.sfen : normalized_sfen);
   r.id = detail::StableId(r.sfen + detail::UsiLine(verification.principal));
   r.canonical_id = detail::StableId(r.normalized_sfen);
   r.parent_id = parent_id; r.double_king = options.double_king; r.conditions = options;
