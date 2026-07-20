@@ -24,6 +24,10 @@ user tsume_verify 1 100000
 # a pseudo-reply must not make an otherwise complete work imperfect.
 position sfen 8B/5+RgSk/9/9/7L+p/9/9/9/9 b Nrb3g3s3n3l17p 1
 user tsume_verify 9 20000000
+# A mathematically perfect but mechanical chasing mate must not pass the
+# publication-quality aesthetic gate.
+position sfen 9/6k2/9/5B3/9/9/9/9/9 b GS2rb3g3s4n4l18p 1
+user tsume_verify 9 5000000
 user tsume_generate 5 1 rejected.sfen
 position sfen 7K1/9/9/9/9/9/9/9/7k1 w - 1
 user tsume_verify 3 1000
@@ -46,7 +50,7 @@ quit
   $records = $commands | Where-Object { $_ -match "tsume_json " } | ForEach-Object {
     ($_ -replace '^.*tsume_json ', '') | ConvertFrom-Json
   }
-  if ($records.Count -ne 5) { throw "expected five JSON records" }
+  if ($records.Count -ne 6) { throw "expected six JSON records" }
   if ($records[0].id -ne $records[1].id -or
       $records[0].canonicalId -ne $records[1].canonicalId -or
       $records[0].matePly -ne $records[1].matePly) { throw "JSON round-trip mismatch" }
@@ -55,6 +59,10 @@ quit
   if (-not $records[4].complete -or -not $records[4].unique -or -not $records[4].perfect -or
       -not $records[4].futileInterposition -or $records[4].matePly -ne 9) {
     throw "futile-interposition perfection regression"
+  }
+  if (-not $records[5].complete -or -not $records[5].perfect -or $records[5].aestheticPass -or
+      $records[5].chaseRatio -lt 0.75 -or $records[5].aestheticReasons -notcontains "mechanical chasing mate") {
+    throw "aesthetic chasing-mate gate regression"
   }
   if ($null -eq $records[0].scores.totalScore -or $null -eq $records[0].attacks -or
       $null -eq $records[0].reasons) { throw "required JSON fields missing" }

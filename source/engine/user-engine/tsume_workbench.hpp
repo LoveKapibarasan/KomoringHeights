@@ -84,6 +84,10 @@ struct AestheticScores {
 struct TechniqueSummary {
   int sacrifices{0}, major_sacrifices{0}, consecutive_sacrifices{0};
   int drops{0}, promotions{0}, non_promotions{0}, discovered_checks{0}, double_checks{0};
+  int attacker_moves{0}, contact_checks{0}, defender_moves{0}, defender_king_moves{0};
+  int non_king_defences{0};
+  double chase_ratio{0};
+  bool chasing_mate{false};
   std::vector<std::string> names;
 };
 
@@ -99,6 +103,8 @@ struct WorkRecord {
   VerifyResult verification;
   AestheticScores scores;
   TechniqueSummary techniques;
+  bool aesthetic_pass{false};
+  std::vector<std::string> aesthetic_reasons;
 };
 
 namespace detail {
@@ -436,8 +442,16 @@ inline TechniqueSummary AnalyzeTechniques(Position& pos, const std::vector<Move>
   for (std::size_t i = 0; i < line.size(); ++i) {
     const Move m = line[i];
     const Piece moved = pos.moved_piece_before(m);
-    if (is_drop(m)) ++t.drops;
-    if (is_promote(m)) ++t.promotions;
+    if (i % 2 == 0) {
+      ++t.attacker_moves;
+      if (is_drop(m)) ++t.drops;
+      if (is_promote(m)) ++t.promotions;
+    } else {
+      ++t.defender_moves;
+      // KING is encoded outside raw_type_of()'s three-bit unpromoted mask.
+      if (type_of(moved) == KING) ++t.defender_king_moves;
+      else ++t.non_king_defences;
+    }
     bool sacrifice = false;
     if (i % 2 == 0 && i + 1 < line.size()) {
       // The following defence captures the checking piece on its arrival square.
@@ -452,15 +466,32 @@ inline TechniqueSummary AnalyzeTechniques(Position& pos, const std::vector<Move>
     }
     previous_sacrifice = sacrifice;
     pos.do_move(m, states[i]);
-    if (i % 2 == 0 && pos.checkers().pop_count() > 1) ++t.double_checks;
+    if (i % 2 == 0) {
+      const Square king = pos.king_square(pos.side_to_move());
+      const Square arrival = to_sq(m);
+      const int file_distance = std::abs(static_cast<int>(file_of(arrival)) - static_cast<int>(file_of(king)));
+      const int rank_distance = std::abs(static_cast<int>(rank_of(arrival)) - static_cast<int>(rank_of(king)));
+      if (std::max(file_distance, rank_distance) <= 1) ++t.contact_checks;
+      if (pos.checkers().pop_count() > 1) ++t.double_checks;
+      else if (!pos.checkers().test(arrival)) ++t.discovered_checks;
+    }
   }
   for (auto it = line.rbegin(); it != line.rend(); ++it) pos.undo_move(*it);
   if (t.sacrifices) t.names.push_back("sacrifice");
   if (t.major_sacrifices) t.names.push_back("major-piece sacrifice");
   if (t.consecutive_sacrifices) t.names.push_back("consecutive sacrifices");
-  if (t.drops) t.names.push_back("drop");
-  if (t.promotions) t.names.push_back("promotion");
+  if (t.discovered_checks) t.names.push_back("discovered check");
   if (t.double_checks) t.names.push_back("double check");
+  const double king_escape_ratio = t.defender_moves ?
+      static_cast<double>(t.defender_king_moves) / t.defender_moves : 0.0;
+  const double contact_ratio = t.attacker_moves ?
+      static_cast<double>(t.contact_checks) / t.attacker_moves : 0.0;
+  t.chase_ratio = (king_escape_ratio + contact_ratio) / 2.0;
+  t.chasing_mate = t.attacker_moves >= 3 && t.sacrifices == 0 &&
+                   t.discovered_checks == 0 && t.double_checks == 0 &&
+                   t.non_king_defences == 0 &&
+                   (t.chase_ratio >= 0.75 || king_escape_ratio >= 0.90);
+  if (t.chasing_mate) t.names.push_back("chasing mate");
   return t;
 }
 
@@ -478,10 +509,14 @@ inline AestheticScores Score(Position& pos, const VerifyResult& v, const Techniq
   s.legalityScore = v.complete && v.proof == Proof::kMate && !v.prohibited_move ? 100 : 0;
   s.uniquenessScore = v.unique ? 100 : (v.proof == Proof::kMate ? 20 : 0);
   s.lengthScore = std::min(100.0, std::max(0, v.mate_ply) * 5.0);
-  s.complexityScore = std::min(100.0, v.longest_lines.size() * 8.0 + v.attacks.size() * 3.0);
+  s.complexityScore = std::min(100.0, v.longest_lines.size() * 10.0 +
+                                      t.non_king_defences * 8.0 + t.discovered_checks * 12.0);
   s.sacrificeScore = std::min(100.0, t.sacrifices * 18.0 + t.major_sacrifices * 22.0 +
                                       t.consecutive_sacrifices * 12.0);
-  s.techniqueScore = std::min(100.0, t.names.size() * 14.0 + t.double_checks * 12.0);
+  s.techniqueScore = std::min(100.0, t.sacrifices * 10.0 + t.major_sacrifices * 18.0 +
+                                      t.consecutive_sacrifices * 15.0 +
+                                      t.discovered_checks * 18.0 + t.double_checks * 20.0 +
+                                      t.non_king_defences * 4.0);
   const int board_pieces = pos.pieces().pop_count();
   s.economyScore = std::max(0.0, 100.0 - std::max(0, board_pieces - 3) * 5.0);
   if (v.unnecessary_piece) s.economyScore = 0;
@@ -491,6 +526,7 @@ inline AestheticScores Score(Position& pos, const VerifyResult& v, const Techniq
   s.originalityScore = 50;
   s.aestheticScore = (s.lengthScore + s.complexityScore + s.sacrificeScore +
                       s.techniqueScore + s.economyScore + s.visualScore) / 6.0;
+  if (t.chasing_mate) s.aestheticScore = std::min(s.aestheticScore, 20.0);
   s.totalScore = s.legalityScore * .18 + s.uniquenessScore * .18 + s.lengthScore * .10 +
                  s.complexityScore * .08 + s.sacrificeScore * .10 + s.techniqueScore * .10 +
                  s.economyScore * .09 + s.visualScore * .05 + s.originalityScore * .04 +
@@ -498,6 +534,7 @@ inline AestheticScores Score(Position& pos, const VerifyResult& v, const Techniq
   if (!(v.complete && v.proof == Proof::kMate && v.unique) || v.piece_surplus ||
       v.unnecessary_piece || v.futile_interposition || v.prohibited_move)
     s.totalScore = std::min(s.totalScore, 49.0);
+  if (t.chasing_mate) s.totalScore = std::min(s.totalScore, 25.0);
   return s;
 }
 
@@ -520,6 +557,18 @@ inline WorkRecord MakeRecord(Position& pos, const std::string& normalized_sfen,
   r.perfect = r.verification.complete && r.verification.proof == Proof::kMate && r.verification.unique &&
               !r.verification.shorter_mate && !r.verification.piece_surplus &&
               !r.verification.unnecessary_piece && !r.verification.prohibited_move;
+  if (!r.perfect) r.aesthetic_reasons.push_back("composition completeness gate failed");
+  if (r.verification.mate_ply < 7)
+    r.aesthetic_reasons.push_back("shorter than the formal seven-ply minimum");
+  if (r.techniques.chasing_mate) r.aesthetic_reasons.push_back("mechanical chasing mate");
+  const bool meaningful_technique = r.techniques.sacrifices > 0 ||
+      r.techniques.major_sacrifices > 0 || r.techniques.consecutive_sacrifices > 0 ||
+      r.techniques.discovered_checks > 0 || r.techniques.double_checks > 0 ||
+      r.techniques.non_king_defences > 0;
+  if (!meaningful_technique) r.aesthetic_reasons.push_back("no detected thematic technique");
+  if (r.scores.aestheticScore < 35.0) r.aesthetic_reasons.push_back("aesthetic score below 35");
+  r.aesthetic_pass = r.perfect && r.verification.mate_ply >= 7 && !r.techniques.chasing_mate &&
+                     meaningful_technique && r.scores.aestheticScore >= 35.0;
   const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
   std::tm tm{};
 #if defined(_WIN32)
@@ -588,7 +637,22 @@ inline std::string ToJson(const WorkRecord& r, Position& root) {
     << ",\"maxNodes\":" << r.conditions.max_nodes << ",\"generatedAt\":\"" << r.generated_at << "\",";
   o << "\"scores\":{"; WriteScores(o, r.scores); o << "},\"techniques\":[";
   for (std::size_t i = 0; i < r.techniques.names.size(); ++i) { if (i) o << ','; o << '"' << detail::EscapeJson(r.techniques.names[i]) << '"'; }
-  o << "],\"attacks\":[";
+  o << "],\"aestheticPass\":" << (r.aesthetic_pass ? "true" : "false")
+    << ",\"aestheticReasons\":[";
+  for (std::size_t i = 0; i < r.aesthetic_reasons.size(); ++i) {
+    if (i) o << ',';
+    o << '"' << detail::EscapeJson(r.aesthetic_reasons[i]) << '"';
+  }
+  o << "],\"chaseRatio\":" << r.techniques.chase_ratio
+    << ",\"aestheticMetrics\":{\"attackerMoves\":" << r.techniques.attacker_moves
+    << ",\"contactChecks\":" << r.techniques.contact_checks
+    << ",\"defenderMoves\":" << r.techniques.defender_moves
+    << ",\"defenderKingMoves\":" << r.techniques.defender_king_moves
+    << ",\"nonKingDefences\":" << r.techniques.non_king_defences
+    << ",\"sacrifices\":" << r.techniques.sacrifices
+    << ",\"discoveredChecks\":" << r.techniques.discovered_checks
+    << ",\"doubleChecks\":" << r.techniques.double_checks << "}"
+    << ",\"attacks\":[";
   for (std::size_t i = 0; i < r.verification.attacks.size(); ++i) {
     const auto& b = r.verification.attacks[i]; if (i) o << ',';
     o << "{\"move\":\"" << USI::move(b.move) << "\",\"status\":\"" << detail::ProofName(b.proof)

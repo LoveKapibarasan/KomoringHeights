@@ -404,7 +404,12 @@ void GenerateProblemsForMoves(int target_moves, int count,
         for (Move m : complete_result.principal) problem.solution.push_back(USI::move(m));
         auto record = komori::tsume::MakeRecord(normalized, problem.sfen, verify_options,
                                                 std::move(complete_result));
-        if (!record.perfect) continue;
+        if (!record.aesthetic_pass) {
+          sync_cout << "info string [candidate rejected] aesthetic gate:";
+          for (const auto& reason : record.aesthetic_reasons) sync_cout << ' ' << reason << ';';
+          sync_cout << sync_endl;
+          continue;
+        }
         problem.record_json = komori::tsume::ToJson(record, normalized);
 
         // 右上チェック（正規形後）
@@ -559,7 +564,7 @@ void user_test(Position& pos, std::istringstream& is) {
       AnalyzeUnnecessaryPieces(candidate.sfen(), options, result);
       auto normalized = CanonicalizeVerified(candidate.sfen(), options, result);
       auto record = komori::tsume::MakeRecord(candidate, normalized, options, std::move(result), parent_id);
-      if (!record.perfect || !ids.insert(record.canonical_id).second) continue;
+      if (!record.aesthetic_pass || !ids.insert(record.canonical_id).second) continue;
       int same = 0, total = 0; for (int r = 0; r < 9; ++r) for (int f = 0; f < 9; ++f)
         if (!source[r][f].empty() || !board[r][f].empty()) { ++total; if (source[r][f] == board[r][f]) ++same; }
       record.parent_similarity = total ? double(same) / total : 1.0; record.parent_mate_ply = base_result.mate_ply;
