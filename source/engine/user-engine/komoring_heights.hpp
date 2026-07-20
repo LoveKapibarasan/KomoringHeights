@@ -43,6 +43,9 @@ class KomoringHeights {
   /// 置換表の内容をすべて削除する。ベンチマーク用。
   void Clear();
 
+  /// TT のリサイズなしにオプションを更新する（生成ループ内での繰り返し利用向け）
+  void UpdateOption(const EngineOption& option) { option_ = option; }
+
   /**
    * @brief 詰み手順を取得する
    * @pre Search() の戻り値が `NodeState::kProven`
