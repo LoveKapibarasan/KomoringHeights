@@ -498,11 +498,22 @@ inline TechniqueSummary AnalyzeTechniques(Position& pos, const std::vector<Move>
 
 inline bool HasSurplusAttackerHand(Position& pos, const std::vector<Move>& line) {
   const Color attacker = pos.side_to_move();
+  const Hand initial_hand = pos.hand_of(attacker);
+  if (initial_hand == 0) return false;  // no initial hand pieces, nothing to be surplus
   std::vector<StateInfo> states(line.size());
   for (std::size_t i = 0; i < line.size(); ++i) pos.do_move(line[i], states[i]);
-  const bool surplus = pos.hand_of(attacker) != 0;
+  const Hand final_hand = pos.hand_of(attacker);
   for (auto it = line.rbegin(); it != line.rend(); ++it) pos.undo_move(*it);
-  return surplus;
+  // Surplus = initial hand pieces still in hand at the end (never dropped)
+  // Heuristic: if final_count >= initial_count for any piece type, that type is surplus.
+  // Edge case (drop then recapture same type) is accepted as rare.
+  static constexpr PieceType kPieceTypes[] = {PAWN, LANCE, KNIGHT, SILVER, GOLD, BISHOP, ROOK};
+  for (auto pt : kPieceTypes) {
+    const int init_cnt = hand_count(initial_hand, pt);
+    if (init_cnt <= 0) continue;
+    if (hand_count(final_hand, pt) >= init_cnt) return true;
+  }
+  return false;
 }
 
 inline AestheticScores Score(Position& pos, const VerifyResult& v, const TechniqueSummary& t) {

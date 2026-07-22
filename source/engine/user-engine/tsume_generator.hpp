@@ -157,12 +157,19 @@ inline std::string GenerateCandidateSfen(std::mt19937& rng, int target_moves = 3
   used_count.fill(0);
   std::string hand_str;
 
+  // 大駒（飛・角）は1枚まで: 複数あると非限定詰みになりやすい
+  int major_pieces_used = 0;
+  static constexpr int kMaxMajorPieces = 1;  // B=index5, R=index6
+
   for (int i = 0; i < num_pieces; ++i) {
     // 使用可能枚数が残っている駒種を選択
     int piece_idx = -1;
     for (int attempt = 0; attempt < 30; ++attempt) {
       int idx = piece_type_dist(rng);
       if (used_count[idx] < kPieceMaxTotal[idx]) {
+        // 大駒制限
+        const bool is_major = (idx == 5 || idx == 6);  // B=index5, R=index6
+        if (is_major && major_pieces_used >= kMaxMajorPieces) continue;
         piece_idx = idx;
         break;
       }
@@ -205,6 +212,7 @@ inline std::string GenerateCandidateSfen(std::mt19937& rng, int target_moves = 3
     }
 
     ++used_count[piece_idx];
+    if (piece_idx == 5 || piece_idx == 6) ++major_pieces_used;
   }
 
   // Add a small number of generated defender pieces around the king.  Purely
@@ -241,15 +249,24 @@ inline std::string GenerateCandidateSfen(std::mt19937& rng, int target_moves = 3
     if (placed) ++used_count[piece_idx];
   }
 
-  // 残り駒を受け方持ち駒に割り当て（40枚完全使用: 攻め方未使用分を受け方持ち駒へ）
-  // 盤上の受け方の玉(k)はすでに配置済み。それ以外の未使用駒を受け方持ち駒に回す
+  // 受け方持ち駒: 全余剰駒を渡すと EV の合駒分岐が爆発するため、
+  // 0〜2 種をランダムに選んで 1 枚ずつ渡す（合駒手筋を残しつつ分岐を抑制）。
+  // 残りの駒は「局面外（使用しない）」として扱う（詰将棋は 40 枚完全使用不要）。
   std::string gote_hand_str;
-  for (int i = 0; i < static_cast<int>(kPieceChars.size()); ++i) {
-    // 盤上に配置された攻め方の駒はカウント済み（used_count）
-    // 残り枚数 = 全駒数 - 攻め方が使用した枚数
-    const int remaining = kPieceMaxTotal[i] - used_count[i];
-    for (int j = 0; j < remaining; ++j) {
-      gote_hand_str += static_cast<char>(std::tolower(static_cast<unsigned char>(kPieceChars[i])));
+  {
+    std::uniform_int_distribution<int> def_hand_types_dist(0, 2);
+    const int def_hand_types = def_hand_types_dist(rng);
+    std::array<int, 7> def_hand_used{};
+    for (int h = 0; h < def_hand_types; ++h) {
+      for (int attempt = 0; attempt < 15; ++attempt) {
+        const int idx = piece_type_dist(rng);
+        if (used_count[idx] + def_hand_used[idx] < kPieceMaxTotal[idx]) {
+          gote_hand_str += static_cast<char>(std::tolower(
+              static_cast<unsigned char>(kPieceChars[idx])));
+          ++def_hand_used[idx];
+          break;
+        }
+      }
     }
   }
 

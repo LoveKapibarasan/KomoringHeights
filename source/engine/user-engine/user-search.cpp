@@ -120,8 +120,19 @@ static std::string StripSurplusAttackerHand(
     }
   }
   if (new_hand.empty()) new_hand = "-";
-  const std::string base = board_str + " " + turn + " " + new_hand + " " + move_num;
-  return komori::detail::CompleteDefenderReserve(base, false);
+  // 剥ぎ取った攻め方の駒を受け方持ち駒に加える（CompleteDefenderReserve は
+  // 全余剰駒を一括追加するため使わない。必要分だけ追記する）
+  for (int i = 0; i < 7; ++i) {
+    const int add = surplus_count[i];
+    if (add <= 0) continue;
+    const char lc = static_cast<char>(std::tolower(
+        static_cast<unsigned char>(kHandChars[i])));
+    if (new_hand == "-") new_hand.clear();
+    if (add > 1) new_hand += std::to_string(add);
+    new_hand += lc;
+  }
+  if (new_hand.empty()) new_hand = "-";
+  return board_str + " " + turn + " " + new_hand + " " + move_num;
 }
 // ---------------------------------------------------------------------------
 // 邪魔駒確認: 盤上の各駒（玉以外）を除いても同じ手数で詰むなら除去する
@@ -537,6 +548,8 @@ void GenerateProblemsForMoves(int target_moves, int count,
         // 目標手数の生候補を失わないよう、延長より先に完全検証する。
         // 従来は未検証の延長候補で元の9手候補を上書きしていた。
         sync_cout << "info string [raw candidate] " << mate_in << " ply: " << sfen << sync_endl;
+        // strip_verified_necessary=true → 持ち駒除去でdf-pn失敗=変化に必要=piece_surplusは偽陽性
+        bool strip_verified_necessary = false;
         if (komori::tsume::HasSurplusAttackerHand(gen_pos, best_moves)) {
           // 余剰持ち駒を取り除いて受け方の予備に戻し、局面を再設定する
           const std::string stripped = StripSurplusAttackerHand(sfen, gen_pos, best_moves);
@@ -557,9 +570,9 @@ void GenerateProblemsForMoves(int target_moves, int count,
           Threads.start_thinking(gen_pos, st, retry_limits, false);
           Threads.main()->wait_for_search_finished();
           if (g_search_result != komori::NodeState::kProven) {
-            // 剥ぎ取り後に詰まなくなった → 手持ち駒が応手に影響していた偽陽性。
-            // 元の局面のまま ExhaustiveVerifier に委ねる (piece_surplus を正しく判定させる)。
+            // 剥ぎ取り後に詰まなくなった → 持ち駒が変化に必要。EV の surplus 判定を信用しない。
             sync_cout << "info string [strip] re-mate failed - falling back to original pos for EV" << sync_endl;
+            strip_verified_necessary = true;
             st.reset(new StateList(1));
             gen_pos.set(sfen, &st->back(), Threads.main());
             // problem.sfen/solution は既に元の値のまま
@@ -570,19 +583,107 @@ void GenerateProblemsForMoves(int target_moves, int count,
               continue;
             }
             if (komori::tsume::HasSurplusAttackerHand(gen_pos, retry_moves)) {
-              sync_cout << "info string [candidate rejected] surplus remains after strip" << sync_endl;
-              continue;
+              // 剥ぎ取り後もまだ余剰（取った駒が手に残った等）→ EV に委ねる
+              sync_cout << "info string [strip] surplus remains - falling back to original pos for EV" << sync_endl;
+              st.reset(new StateList(1));
+              gen_pos.set(sfen, &st->back(), Threads.main());
+              // problem.sfen/solution は既に元の値のまま
+            } else {
+              // 剥ぎ取り成功 — 以降は stripped の位置を使用
+              problem.sfen = stripped;
+              problem.solution.clear();
+              for (const auto& m : retry_moves) problem.solution.push_back(USI::move(m));
+              sync_cout << "info string [strip ok] " << stripped << sync_endl;
             }
-            // 剥ぎ取り成功 — 以降は stripped の位置を使用
-            problem.sfen = stripped;
-            problem.solution.clear();
-            for (const auto& m : retry_moves) problem.solution.push_back(USI::move(m));
-            sync_cout << "info string [strip ok] " << stripped << sync_endl;
+          }
+        }
+
+        // 邪魔駒除去前の簡易EV: 手数・限定性の早期チェック（高コストな邪魔駒除去前に棄却）
+        {
+          komori::tsume::VerifyOptions quick_opts;
+          quick_opts.max_ply = problem.mate_in;
+          quick_opts.max_nodes = std::max<std::uint64_t>(1'500'000ULL,
+              komori::detail::ComputeNodesLimit(problem.mate_in));
+          quick_opts.double_king = false;
+          Position quick_pos; StateListPtr quick_st(new StateList(1));
+          quick_pos.set(problem.sfen, &quick_st->back(), Threads.main());
+          komori::tsume::ExhaustiveVerifier quick_ev(quick_opts);
+          const auto quick_result = quick_ev.Run(quick_pos);
+          if (quick_result.complete &&
+              (quick_result.proof != komori::tsume::Proof::kMate ||
+               !quick_result.unique ||
+               quick_result.mate_ply != problem.mate_in)) {
+            sync_cout << "info string [candidate rejected quick-ev] unique="
+                      << quick_result.unique << " matePly=" << quick_result.mate_ply
+                      << " surplus=" << quick_result.piece_surplus << sync_endl;
+            continue;
           }
         }
 
         // 邪魔駒確認: 不要な駒を除去して局面を簡潔に
         problem = RemoveUnnecessaryPieces(problem, time_limit_ms);
+
+        // 邪魔駒除去後に再び余剰持ち駒が生まれた場合は改めて剥ぎ取る
+        {
+          st.reset(new StateList(1));
+          gen_pos.set(problem.sfen, &st->back(), Threads.main());
+          // 解の手順を盤面を進めながら変換（手番が交互なので根局面では全手変換不可）
+          std::vector<Move> sol_moves;
+          std::vector<StateInfo> tmp_states(problem.solution.size());
+          {
+            Position tmp; StateListPtr tmp_st(new StateList(1));
+            tmp.set(problem.sfen, &tmp_st->back(), Threads.main());
+            bool ok = true;
+            for (std::size_t si = 0; si < problem.solution.size(); ++si) {
+              const Move mv = USI::to_move(tmp, problem.solution[si]);
+              if (mv == MOVE_NONE) { ok = false; break; }
+              sol_moves.push_back(mv);
+              tmp.do_move(mv, tmp_states[si]);
+            }
+            if (!ok) sol_moves.clear();
+          }
+          if (!sol_moves.empty()) {
+            if (komori::tsume::HasSurplusAttackerHand(gen_pos, sol_moves)) {
+              const std::string stripped2 = StripSurplusAttackerHand(problem.sfen, gen_pos, sol_moves);
+              if (!stripped2.empty() && stripped2 != problem.sfen) {
+                gen_pos.set(stripped2, &st->back(), Threads.main());
+                if (komori::ValidateTsumePosition(gen_pos).empty() && !gen_pos.in_check()) {
+                  Search::LimitsType lim2; lim2.mate = static_cast<int>(time_limit_ms / 2);
+                  Time.reset();
+                  Threads.start_thinking(gen_pos, st, lim2, false);
+                  Threads.main()->wait_for_search_finished();
+                  if (g_search_result == komori::NodeState::kProven) {
+                    const auto& bm2 = g_searcher.BestMoves();
+                    if (static_cast<int>(bm2.size()) == target_moves) {
+                      problem.sfen = stripped2;
+                      problem.solution.clear();
+                      for (const auto& m : bm2) problem.solution.push_back(USI::move(m));
+                      sync_cout << "info string [post-strip ok] " << stripped2 << sync_endl;
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        // 短手詰め事前チェック: target_moves より短い詰みがあれば早期棄却
+        if (problem.mate_in >= 5) {
+          komori::tsume::VerifyOptions short_opts;
+          short_opts.max_ply = problem.mate_in - 2;
+          short_opts.max_nodes = 300'000;
+          short_opts.double_king = false;
+          Position short_pos; StateListPtr short_st(new StateList(1));
+          short_pos.set(problem.sfen, &short_st->back(), Threads.main());
+          komori::tsume::ExhaustiveVerifier short_ev(short_opts);
+          const auto short_result = short_ev.Run(short_pos);
+          if (short_result.proof == komori::tsume::Proof::kMate) {
+            sync_cout << "info string [candidate rejected] shorter mate: "
+                      << short_result.mate_ply << "ply (expected " << problem.mate_in << ")"
+                      << sync_endl;
+            continue;
+          }
+        }
 
         // df-pnで見つかった候補を作品検査用の全幅AND/OR探索で再検証する。
         komori::tsume::VerifyOptions verify_options;
@@ -594,7 +695,9 @@ void GenerateProblemsForMoves(int target_moves, int count,
         candidate.set(problem.sfen, &candidate_states->back(), Threads.main());
         komori::tsume::ExhaustiveVerifier complete_verifier(verify_options);
         auto complete_result = complete_verifier.Run(candidate);
-        const bool surplus = komori::tsume::HasSurplusAttackerHand(candidate, complete_result.principal);
+        // strip_verified_necessary=trueの場合、主変化で駒を使わなくても変化に必要=surplus偽陽性
+        const bool surplus = !strip_verified_necessary &&
+                             komori::tsume::HasSurplusAttackerHand(candidate, complete_result.principal);
         if (!complete_result.complete || complete_result.proof != komori::tsume::Proof::kMate ||
             !complete_result.unique || complete_result.mate_ply != problem.mate_in || surplus) {
           sync_cout << "info string [candidate rejected] nodes=" << complete_result.nodes
@@ -624,7 +727,13 @@ void GenerateProblemsForMoves(int target_moves, int count,
         auto record = komori::tsume::MakeRecord(normalized, problem.sfen, verify_options,
                                                 std::move(complete_result));
         if (!record.aesthetic_pass) {
-          sync_cout << "info string [candidate rejected] aesthetic gate:";
+          sync_cout << "info string [candidate rejected] aesthetic gate:"
+                    << " perfect=" << record.perfect
+                    << " matePly=" << record.verification.mate_ply
+                    << " chasing=" << record.techniques.chasing_mate
+                    << " score=" << record.scores.aestheticScore
+                    << " sacr=" << record.techniques.sacrifices
+                    << " non_king_def=" << record.techniques.non_king_defences;
           for (const auto& reason : record.aesthetic_reasons) sync_cout << ' ' << reason << ';';
           sync_cout << sync_endl;
           // 追い詰め候補も perturb で改善できる場合があるため条件に含める
