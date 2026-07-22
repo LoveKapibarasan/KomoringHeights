@@ -465,7 +465,8 @@ static std::optional<komori::TsumeGeneratedProblem> PerturbAndRetry(
 
 void GenerateProblemsForMoves(int target_moves, int count,
                                std::mt19937& rng,
-                               std::vector<komori::TsumeGeneratedProblem>& found) {
+                               std::vector<komori::TsumeGeneratedProblem>& found,
+                               const std::string& output_file = "") {
   // 生成ループ用: 小さい TT + silent で Init（大 TT だと初回アクセス時のページフォルトで詰まる）
   komori::EngineOption gen_option = g_option;
   gen_option.hash_mb              = 64;
@@ -481,6 +482,10 @@ void GenerateProblemsForMoves(int target_moves, int count,
 
   for (int attempt = 0; attempt < max_attempts && static_cast<int>(found.size()) < target_count;
        ++attempt) {
+    if (attempt > 0 && attempt % 500 == 0)
+      sync_cout << "info string [tsume_generate] 試行 " << attempt << "/" << max_attempts
+                << " 発見済み " << (static_cast<int>(found.size()) - target_count + count)
+                << "/" << count << sync_endl;
     // ランダム候補局面を生成（手数に応じた駒数を使用）
     const std::string sfen = komori::detail::GenerateCandidateSfen(rng, target_moves);
 
@@ -736,10 +741,11 @@ void GenerateProblemsForMoves(int target_moves, int count,
                     << " non_king_def=" << record.techniques.non_king_defences;
           for (const auto& reason : record.aesthetic_reasons) sync_cout << ' ' << reason << ';';
           sync_cout << sync_endl;
-          // 追い詰め候補も perturb で改善できる場合があるため条件に含める
+          // chasing_mateのみが不合格原因なら perturbで改善できないことが多い→スキップ
           const bool worth_retry = record.perfect &&
                                    record.verification.mate_ply >= 7 &&
-                                   record.scores.aestheticScore >= 15.0;
+                                   record.scores.aestheticScore >= 15.0 &&
+                                   !record.techniques.chasing_mate;
           if (worth_retry) {
             sync_cout << "info string [perturb] score=" << record.scores.aestheticScore
                       << " - trying nearby positions" << sync_endl;
@@ -775,6 +781,8 @@ void GenerateProblemsForMoves(int target_moves, int count,
                   << "/" << count
                   << (all_right ? " [右寄り]" : "") << (all_upper ? " [上寄り]" : "")
                   << ": " << problem.sfen << sync_endl;
+        if (!output_file.empty())
+          komori::SaveTsumeProblems({problem}, output_file);
       }
     }
   }
@@ -1020,12 +1028,12 @@ void user_test(Position& pos, std::istringstream& is) {
     std::vector<komori::TsumeGeneratedProblem> found;
 
     g_tsume_gen_silent = true;
-    GenerateProblemsForMoves(target_moves, count, rng, found);
+    GenerateProblemsForMoves(target_moves, count, rng, found, output_file);
     g_tsume_gen_silent = false;
 
     if (found.empty()) {
       sync_cout << "info string [tsume_generate] 問題を生成できませんでした" << sync_endl;
-    } else {
+    } else if (output_file.empty()) {
       komori::SaveTsumeProblems(found, output_file);
     }
     return;
@@ -1076,7 +1084,7 @@ void user_test(Position& pos, std::istringstream& is) {
                 << komori::detail::ComputeTimeLimitMs(moves) << "ms/局面) =====" << sync_endl;
 
       const std::size_t before = all_found.size();
-      GenerateProblemsForMoves(moves, count_each, rng, all_found);
+      GenerateProblemsForMoves(moves, count_each, rng, all_found, output_file);
       const int got = static_cast<int>(all_found.size() - before);
 
       sync_cout << "info string [tsume_batch_generate] " << moves << "手詰め: "
@@ -1088,7 +1096,7 @@ void user_test(Position& pos, std::istringstream& is) {
     sync_cout << "info string [tsume_batch_generate] 合計 " << all_found.size()
               << " 問生成完了" << sync_endl;
 
-    if (!all_found.empty()) {
+    if (!all_found.empty() && output_file.empty()) {
       komori::SaveTsumeProblems(all_found, output_file);
     }
     return;
