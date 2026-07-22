@@ -173,8 +173,10 @@ inline std::string GenerateCandidateSfen(std::mt19937& rng, int target_moves = 3
 
     // 盤上 or 持ち駒のどちらに置くか決定
     // 歩は盤上に置くと二歩になりやすいので持ち駒優先にする
+    // 攻め方持ち駒が解答で使われないと「駒余り」で不合格になるため、盤上を強く優先する
     const bool prefer_hand = (piece == 'P');
-    bool place_on_board = (!prefer_hand) && (hand_or_board_dist(rng) == 0);
+    std::bernoulli_distribution board_bias(0.85);
+    bool place_on_board = (!prefer_hand) && board_bias(rng);
 
     if (place_on_board) {
       // 盤上に配置できるマスを探す

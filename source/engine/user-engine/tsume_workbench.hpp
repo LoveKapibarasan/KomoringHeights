@@ -482,6 +482,7 @@ inline TechniqueSummary AnalyzeTechniques(Position& pos, const std::vector<Move>
   if (t.consecutive_sacrifices) t.names.push_back("consecutive sacrifices");
   if (t.discovered_checks) t.names.push_back("discovered check");
   if (t.double_checks) t.names.push_back("double check");
+  if (t.non_king_defences) t.names.push_back("non-king defence");
   const double king_escape_ratio = t.defender_moves ?
       static_cast<double>(t.defender_king_moves) / t.defender_moves : 0.0;
   const double contact_ratio = t.attacker_moves ?
