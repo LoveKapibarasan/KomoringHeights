@@ -68,6 +68,7 @@ struct VerifyResult {
   bool unnecessary_piece{false};
   bool futile_interposition{false};
   bool prohibited_move{false};
+  int hendou_count{0};  // 変同数: 受け方に同手数の最善応手が複数あったノード数の合計
   std::vector<std::string> unnecessary_squares;
   std::vector<Move> principal;
   std::vector<Branch> attacks;
@@ -115,6 +116,7 @@ struct Eval {
   std::vector<Move> pv;
   std::vector<Line> longest;
   bool futile_interposition{false};
+  int hendou_count{0};  // 変同数: ANDノードで同手数複数応手が存在した回数の累積
 };
 
 struct CacheKey {
@@ -254,6 +256,7 @@ class ExhaustiveVerifier {
     result_.principal = eval.pv;
     result_.longest_lines = eval.longest;
     result_.futile_interposition = eval.futile_interposition;
+    result_.hendou_count = eval.hendou_count;
     result_.complete = eval.proof != Proof::kUnknown && !budget_hit_;
 
     // Root attacks are intentionally searched again only through cached values;
@@ -349,6 +352,8 @@ class ExhaustiveVerifier {
       else best.proof = Proof::kNoMate;
     } else {
       int max_len = -1;
+      int moves_at_max = 0;     // max_lenを達成する有効応手数（変同カウント用）
+      int max_child_hendou = 0; // max_len達成子ノードの変同数の最大値
       bool refuted = false;
       int effective_replies = 0;
       std::vector<Line> longest;
@@ -375,7 +380,13 @@ class ExhaustiveVerifier {
           saw_unknown = true;
         } else {
           const int len = child.len + 1;
-          if (len > max_len) { max_len = len; longest.clear(); best.pv = {m}; best.pv.insert(best.pv.end(), child.pv.begin(), child.pv.end()); }
+          if (len > max_len) {
+            max_len = len; moves_at_max = 1; max_child_hendou = child.hendou_count;
+            longest.clear(); best.pv = {m}; best.pv.insert(best.pv.end(), child.pv.begin(), child.pv.end());
+          } else if (len == max_len) {
+            ++moves_at_max;
+            max_child_hendou = std::max(max_child_hendou, child.hendou_count);
+          }
           if (len == max_len) for (auto line : child.longest) { line.moves.insert(line.moves.begin(), m); line.mate_ply++; longest.push_back(std::move(line)); }
         }
       }
@@ -387,7 +398,11 @@ class ExhaustiveVerifier {
       }
       if (refuted) best.proof = saw_repetition ? Proof::kRepetition : Proof::kNoMate;
       else if (saw_unknown) best.proof = Proof::kUnknown;
-      else { best.proof = Proof::kMate; best.len = max_len; best.longest = std::move(longest); }
+      else {
+        best.proof = Proof::kMate; best.len = max_len; best.longest = std::move(longest);
+        // 変同数: このノードでの変同(moves_at_max-1) + 子ノードの変同
+        best.hendou_count = std::max(0, moves_at_max - 1) + max_child_hendou;
+      }
     }
     // Unknown and repetition are path-sensitive and must not be cached.
     if (best.proof == Proof::kMate || best.proof == Proof::kNoMate) table_[ck] = best;
@@ -538,6 +553,9 @@ inline AestheticScores Score(Position& pos, const VerifyResult& v, const Techniq
   s.originalityScore = 50;
   s.aestheticScore = (s.lengthScore + s.complexityScore + s.sacrificeScore +
                       s.techniqueScore + s.economyScore + s.visualScore) / 6.0;
+  // 変同による大幅減点: 変同1件につき-20点（最大-60点）
+  if (v.hendou_count > 0)
+    s.aestheticScore = std::max(0.0, s.aestheticScore - std::min(60.0, v.hendou_count * 20.0));
   if (t.chasing_mate) s.aestheticScore = std::min(s.aestheticScore, 20.0);
   s.totalScore = s.legalityScore * .18 + s.uniquenessScore * .18 + s.lengthScore * .10 +
                  s.complexityScore * .08 + s.sacrificeScore * .10 + s.techniqueScore * .10 +
@@ -578,6 +596,11 @@ inline WorkRecord MakeRecord(Position& pos, const std::string& normalized_sfen,
       r.techniques.discovered_checks > 0 || r.techniques.double_checks > 0 ||
       r.techniques.non_king_defences > 0;
   if (!meaningful_technique) r.aesthetic_reasons.push_back("no detected thematic technique");
+  if (r.verification.hendou_count > 0) {
+    std::ostringstream hs;
+    hs << "hendou (same-move-count alternatives): " << r.verification.hendou_count << " occurrences";
+    r.aesthetic_reasons.push_back(hs.str());
+  }
   if (r.scores.aestheticScore < 35.0) r.aesthetic_reasons.push_back("aesthetic score below 35");
   r.aesthetic_pass = r.perfect && r.verification.mate_ply >= 7 && !r.techniques.chasing_mate &&
                      meaningful_technique && r.scores.aestheticScore >= 35.0;
@@ -604,7 +627,7 @@ inline std::string ToJson(const VerifyResult& r, Position& root) {
   o << "\"human\":\"" << detail::EscapeJson(detail::HumanLine(root, r.principal)) << "\",";
   o << "\"attacks\":[";
   for (std::size_t i = 0; i < r.attacks.size(); ++i) { const auto& b = r.attacks[i]; if (i) o << ','; o << "{\"move\":\"" << USI::move(b.move) << "\",\"status\":\"" << detail::ProofName(b.proof) << "\",\"matePly\":" << b.mate_ply << ",\"line\":\"" << detail::EscapeJson(detail::UsiLine(b.principal)) << "\"}"; }
-  o << "],\"sameLengthVariations\":[";
+  o << "],\"hendouCount\":" << r.hendou_count << ",\"sameLengthVariations\":[";
   for (std::size_t i = 0; i < r.longest_lines.size(); ++i) { if (i) o << ','; o << '"' << detail::EscapeJson(detail::UsiLine(r.longest_lines[i].moves)) << '"'; }
   o << "],\"reasons\":[";
   for (std::size_t i = 0; i < r.reasons.size(); ++i) { if (i) o << ','; o << '"' << detail::EscapeJson(r.reasons[i]) << '"'; }
