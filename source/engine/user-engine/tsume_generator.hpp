@@ -249,27 +249,6 @@ inline std::string GenerateCandidateSfen(std::mt19937& rng, int target_moves = 3
     if (placed) ++used_count[piece_idx];
   }
 
-  // 受け方持ち駒: 全余剰駒を渡すと EV の合駒分岐が爆発するため、
-  // 0〜2 種をランダムに選んで 1 枚ずつ渡す（合駒手筋を残しつつ分岐を抑制）。
-  // 残りの駒は「局面外（使用しない）」として扱う（詰将棋は 40 枚完全使用不要）。
-  std::string gote_hand_str;
-  {
-    std::uniform_int_distribution<int> def_hand_types_dist(0, 2);
-    const int def_hand_types = def_hand_types_dist(rng);
-    std::array<int, 7> def_hand_used{};
-    for (int h = 0; h < def_hand_types; ++h) {
-      for (int attempt = 0; attempt < 15; ++attempt) {
-        const int idx = piece_type_dist(rng);
-        if (used_count[idx] + def_hand_used[idx] < kPieceMaxTotal[idx]) {
-          gote_hand_str += static_cast<char>(std::tolower(
-              static_cast<unsigned char>(kPieceChars[idx])));
-          ++def_hand_used[idx];
-          break;
-        }
-      }
-    }
-  }
-
   // SFEN 文字列を構築（USI 準拠フォーマット）
   // フォーマット: <盤面9段/区切り> <手番 b> <持ち駒(先手大文字+後手小文字)> <手数>
   std::string sfen;
@@ -292,8 +271,7 @@ inline std::string GenerateCandidateSfen(std::mt19937& rng, int target_moves = 3
     if (empty_count > 0) sfen += std::to_string(empty_count);
   }
   sfen += " b ";
-  const std::string all_hand = hand_str + gote_hand_str;
-  sfen += all_hand.empty() ? "-" : all_hand;
+  sfen += hand_str.empty() ? "-" : hand_str;
   sfen += " 1";
   return sfen;
 }

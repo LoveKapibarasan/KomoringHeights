@@ -486,8 +486,9 @@ void GenerateProblemsForMoves(int target_moves, int count,
       sync_cout << "info string [tsume_generate] 試行 " << attempt << "/" << max_attempts
                 << " 発見済み " << (static_cast<int>(found.size()) - target_count + count)
                 << "/" << count << sync_endl;
-    // ランダム候補局面を生成（手数に応じた駒数を使用）
-    const std::string sfen = komori::detail::GenerateCandidateSfen(rng, target_moves);
+    // ランダム候補局面を生成し、詰将棋ルール通り残り全駒を受け方持ち駒に補完（39枚制）
+    const std::string sfen = komori::detail::CompleteDefenderReserve(
+        komori::detail::GenerateCandidateSfen(rng, target_moves), /*double_king=*/false);
 
     Position gen_pos;
     StateListPtr st(new StateList(1));
