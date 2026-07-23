@@ -68,6 +68,19 @@ inline std::string ValidateTsumePosition(const Position& pos) {
     return "出題局面で受け方に王手がかかっています（RootIsAndNodeIfChecked を確認してください）";
   }
 
+  // 二歩チェック: 各筋に同一手番の不成歩が2枚以上あれば違法局面
+  for (int c = 0; c < 2; ++c) {
+    const Piece target = make_piece(static_cast<Color>(c), PAWN);
+    for (int f = FILE_1; f < FILE_NB; ++f) {
+      int pawn_count = 0;
+      for (int r = RANK_1; r < RANK_NB; ++r) {
+        const Square sq = static_cast<File>(f) | static_cast<Rank>(r);
+        if (pos.piece_on(sq) == target) ++pawn_count;
+      }
+      if (pawn_count >= 2) return "同一筋に不成歩が2枚以上あります（二歩局面）";
+    }
+  }
+
   return "";
 }
 

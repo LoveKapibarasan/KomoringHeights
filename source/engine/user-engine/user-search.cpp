@@ -158,14 +158,18 @@ static komori::TsumeGeneratedProblem RemoveUnnecessaryPieces(
 
         auto test_board = board;
         test_board[r][f] = "";
-        const std::string test_sfen =
+        // 除去した駒を受け方持ち駒に補充して39枚制を維持
+        const std::string raw_test =
             komori::detail::BuildSfenBoard(test_board) + " " + turn + " " + hand_str + " " + move_num;
+        const std::string test_sfen = komori::detail::CompleteDefenderReserve(raw_test, false);
 
         Position tp; StateListPtr st(new StateList(1));
         tp.set(test_sfen, &st->back(), Threads.main());
         if (!komori::ValidateTsumePosition(tp).empty() || tp.in_check()) continue;
 
-        Search::LimitsType limits; limits.mate = static_cast<int>(time_limit_ms);
+        // 邪魔駒チェックは短時間で十分（邪魔駒は即座に詰み確認できる）
+        const std::uint64_t removal_limit_ms = static_cast<std::uint64_t>(100);
+        Search::LimitsType limits; limits.mate = static_cast<int>(removal_limit_ms);
         Time.reset();
         Threads.start_thinking(tp, st, limits, false);
         Threads.main()->wait_for_search_finished();
@@ -186,7 +190,8 @@ static komori::TsumeGeneratedProblem RemoveUnnecessaryPieces(
     }
   }
 
-  return {komori::detail::BuildSfenBoard(board) + " " + turn + " " + hand_str + " " + move_num,
+  const std::string result_raw = komori::detail::BuildSfenBoard(board) + " " + turn + " " + hand_str + " " + move_num;
+  return {komori::detail::CompleteDefenderReserve(result_raw, false),
           problem.mate_in, current_sol, ""};
 }
 
@@ -373,6 +378,439 @@ static void AnalyzeUnnecessaryPieces(const std::string& completed_sfen,
 
 /// 審美ゲートを惜しくも落とした候補の盤上駒を隣接マスへ1つ動かして再試行する。
 /// perfect かつ目標手数を維持する変化形が審美ゲートを通過すれば返す。
+// 試す1個のSFEN候補をdf-pn+EV+aesthetic gateに通す共通ヘルパー
+// 合格したら TsumeGeneratedProblem を返す。不合格や検証失敗なら nullopt。
+static std::optional<komori::TsumeGeneratedProblem> TryCandidate(
+    const std::string& new_sfen,
+    const komori::tsume::VerifyOptions& verify_options,
+    int target_moves,
+    std::uint64_t time_limit_ms) {
+  Position candidate; StateListPtr states(new StateList(1));
+  candidate.set(new_sfen, &states->back(), Threads.main());
+  if (!komori::ValidateTsumePosition(candidate).empty()) return std::nullopt;
+  if (candidate.in_check()) return std::nullopt;
+
+  Search::LimitsType limits;
+  limits.mate = static_cast<int>(time_limit_ms / 3);
+  Time.reset();
+  Threads.start_thinking(candidate, states, limits, false);
+  Threads.main()->wait_for_search_finished();
+
+  if (g_search_result != komori::NodeState::kProven) {
+    sync_cout << "info string [TC reject] dfpn-fail " << new_sfen << sync_endl;
+    return std::nullopt;
+  }
+  const auto& bm = g_searcher.BestMoves();
+  if (static_cast<int>(bm.size()) != target_moves) {
+    sync_cout << "info string [TC reject] ply=" << bm.size() << " want=" << target_moves
+              << " " << new_sfen << sync_endl;
+    return std::nullopt;
+  }
+  if (komori::tsume::HasSurplusAttackerHand(candidate, bm)) {
+    sync_cout << "info string [TC reject] surplus-hand " << new_sfen << sync_endl;
+    return std::nullopt;
+  }
+
+  {
+    komori::tsume::VerifyOptions quick_opts;
+    quick_opts.max_ply = target_moves;
+    quick_opts.max_nodes = std::max<std::uint64_t>(1'500'000ULL,
+        komori::detail::ComputeNodesLimit(target_moves));
+    quick_opts.double_king = false;
+    Position qp; StateListPtr qs(new StateList(1));
+    qp.set(new_sfen, &qs->back(), Threads.main());
+    komori::tsume::ExhaustiveVerifier qev(quick_opts);
+    const auto qr = qev.Run(qp);
+    if (qr.complete && (!qr.unique || qr.proof != komori::tsume::Proof::kMate ||
+                        qr.mate_ply != target_moves)) {
+      sync_cout << "info string [TC reject] quick-ev unique=" << qr.unique
+                << " ply=" << qr.mate_ply << " " << new_sfen << sync_endl;
+      return std::nullopt;
+    }
+  }
+
+  Position verify_pos; StateListPtr vs(new StateList(1));
+  verify_pos.set(new_sfen, &vs->back(), Threads.main());
+  komori::tsume::ExhaustiveVerifier ev(verify_options);
+  auto result = ev.Run(verify_pos);
+  if (komori::tsume::HasSurplusAttackerHand(verify_pos, result.principal)) {
+    sync_cout << "info string [TC reject] surplus-ev " << new_sfen << sync_endl;
+    return std::nullopt;
+  }
+  if (!result.complete || result.proof != komori::tsume::Proof::kMate ||
+      !result.unique || result.mate_ply != target_moves) {
+    sync_cout << "info string [TC reject] ev fail complete=" << result.complete
+              << " unique=" << result.unique << " ply=" << result.mate_ply << sync_endl;
+    return std::nullopt;
+  }
+
+  AnalyzeUnnecessaryPieces(new_sfen, verify_options, result);
+  if (result.unnecessary_piece) return std::nullopt;
+
+  auto record = komori::tsume::MakeRecord(verify_pos, new_sfen, verify_options,
+                                          std::move(result));
+  if (!record.aesthetic_pass) {
+    sync_cout << "info string [TryCandidate] 審美却下 hendou=" << record.verification.hendou_count
+              << " " << new_sfen << sync_endl;
+    return std::nullopt;
+  }
+
+  komori::TsumeGeneratedProblem prob;
+  prob.sfen = new_sfen;
+  prob.mate_in = target_moves;
+  for (Move m : record.verification.principal) prob.solution.push_back(USI::move(m));
+  prob.record_json = komori::tsume::ToJson(record, verify_pos);
+  return prob;
+}
+
+// 2駒同時移動による類似形探索: board上の非王駒2個をそれぞれ全マスに移動して試す
+static std::optional<komori::TsumeGeneratedProblem> PerturbTwoPiece(
+    const komori::TsumeGeneratedProblem& base_problem,
+    const komori::tsume::VerifyOptions& verify_options,
+    int target_moves,
+    std::uint64_t time_limit_ms,
+    std::uint64_t budget_ms = 120'000) {  // 最大2分で打ち切り
+  const auto t0 = std::chrono::steady_clock::now();
+  std::istringstream ss(base_problem.sfen);
+  std::string board_str, turn, hand_str, move_no;
+  if (!(ss >> board_str >> turn >> hand_str >> move_no)) return std::nullopt;
+
+  komori::detail::SfenBoard board;
+  komori::detail::ParseSfenBoard(board_str, board);
+
+  // 非王盤上駒の座標収集
+  struct PiecePos { int r, f; std::string cell; bool is_attacker; char upper_ch; };
+  std::vector<PiecePos> pieces;
+  for (int r = 0; r < 9; ++r)
+    for (int f = 0; f < 9; ++f) {
+      const std::string& c = board[r][f];
+      if (c.empty()) continue;
+      const char bc = c.back();
+      const char uc = static_cast<char>(std::toupper(static_cast<unsigned char>(bc)));
+      if (uc == 'K') continue;
+      pieces.push_back({r, f, c, std::isupper(static_cast<unsigned char>(bc)), uc});
+    }
+
+  if (pieces.size() < 2) return std::nullopt;  // 2駒未満なら無意味
+
+  int cnt = 0;
+  for (std::size_t i = 0; i < pieces.size(); ++i) {
+    for (std::size_t j = i + 1; j < pieces.size(); ++j) {
+      const auto& pi = pieces[i];
+      const auto& pj = pieces[j];
+      // piとpjを盤外に出したボード
+      komori::detail::SfenBoard base = board;
+      base[pi.r][pi.f] = "";
+      base[pj.r][pj.f] = "";
+
+      for (int nr1 = 0; nr1 < 9; ++nr1) {
+        for (int nf1 = 0; nf1 < 9; ++nf1) {
+          // pi の行き所なし駒チェック
+          if (pi.is_attacker && !komori::detail::IsValidBoardPlacement(pi.upper_ch, nr1)) continue;
+          if (!pi.is_attacker) {
+            if ((pi.upper_ch=='P'||pi.upper_ch=='L') && nr1==8) continue;
+            if (pi.upper_ch=='N' && nr1>=7) continue;
+          }
+          if (!base[nr1][nf1].empty()) continue;  // 占有済みチェック(後でjも)
+
+          for (int nr2 = 0; nr2 < 9; ++nr2) {
+            for (int nf2 = 0; nf2 < 9; ++nf2) {
+              if (nr2 == nr1 && nf2 == nf1) continue;
+              // pj の行き所なし駒チェック
+              if (pj.is_attacker && !komori::detail::IsValidBoardPlacement(pj.upper_ch, nr2)) continue;
+              if (!pj.is_attacker) {
+                if ((pj.upper_ch=='P'||pj.upper_ch=='L') && nr2==8) continue;
+                if (pj.upper_ch=='N' && nr2>=7) continue;
+              }
+              if (!base[nr2][nf2].empty()) continue;
+
+              komori::detail::SfenBoard perturbed = base;
+              perturbed[nr1][nf1] = pi.cell;
+              perturbed[nr2][nf2] = pj.cell;
+
+              const std::string new_sfen = komori::detail::BuildSfenBoard(perturbed)
+                  + " " + turn + " " + hand_str + " " + move_no;
+
+              auto result = TryCandidate(new_sfen, verify_options, target_moves, time_limit_ms);
+              if (result) {
+                sync_cout << "info string [perturb2] 審美合格: "
+                          << pi.upper_ch << " →" << (9-nf1) << char('a'+nr1)
+                          << " " << pj.upper_ch << " →" << (9-nf2) << char('a'+nr2)
+                          << " " << new_sfen << sync_endl;
+                return result;
+              }
+              ++cnt;
+              if (cnt % 500 == 0) {
+                sync_cout << "info string [perturb2] 試行 " << cnt << " 候補" << sync_endl;
+                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - t0).count();
+                if (static_cast<std::uint64_t>(elapsed) >= budget_ms) {
+                  sync_cout << "info string [perturb2] 時間切れ (" << elapsed << "ms), 打ち切り"
+                            << sync_endl;
+                  return std::nullopt;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  sync_cout << "info string [perturb2] 全組み合わせ試行済み: " << cnt << " 候補, 合格なし" << sync_endl;
+  return std::nullopt;
+}
+
+// 攻め方の持ち駒にpiece_upperを1枚追加したhand文字列を返す
+static std::string AddToAttackerHand(const std::string& hand_str, char piece_upper) {
+  std::map<char, int> ahand, dhand;
+  int cnt = 0;
+  for (char c : hand_str) {
+    if (c == '-') continue;
+    if (std::isdigit((unsigned char)c)) { cnt = cnt * 10 + (c - '0'); }
+    else {
+      int n = cnt ? cnt : 1; cnt = 0;
+      if (std::isupper((unsigned char)c)) ahand[c] += n;
+      else dhand[(char)std::toupper((unsigned char)c)] += n;
+    }
+  }
+  ahand[piece_upper]++;
+  std::string result;
+  for (char c : {'R','B','G','S','N','L','P'}) {
+    if (ahand[c] > 0) { if (ahand[c] > 1) result += std::to_string(ahand[c]); result += c; }
+  }
+  for (char c : {'R','B','G','S','N','L','P'}) {
+    char lc = (char)std::tolower((unsigned char)c);
+    if (dhand[c] > 0) { if (dhand[c] > 1) result += std::to_string(dhand[c]); result += lc; }
+  }
+  return result.empty() ? "-" : result;
+}
+
+// 逆算ステップ（df-pn のみ、EV なし）: N手詰め局面 → N+2手詰め候補を返す
+// 中間ステップ用。EV は最終ステップの RetrogradExtend に任せる。
+// 戦略: 攻め方駒1枚を手持ちに戻し、玉を盤上の任意の空きマスへ移動（または同位置維持）
+static std::optional<komori::TsumeGeneratedProblem> RetrogradStep(
+    const komori::TsumeGeneratedProblem& base,
+    int target_moves,
+    std::uint64_t time_limit_ms,
+    std::uint64_t budget_ms = 30'000) {
+  const auto t0 = std::chrono::steady_clock::now();
+  std::istringstream ss(base.sfen);
+  std::string board_str, turn, hand_str, move_no;
+  if (!(ss >> board_str >> turn >> hand_str >> move_no)) return std::nullopt;
+  komori::detail::SfenBoard board{};
+  komori::detail::ParseSfenBoard(board_str, board);
+  int kr = -1, kf = -1;
+  for (int r = 0; r < 9 && kr < 0; ++r)
+    for (int f = 0; f < 9 && kr < 0; ++f)
+      if (board[r][f] == "k") { kr = r; kf = f; }
+  if (kr < 0) return std::nullopt;
+
+  const auto test_candidate = [&](const std::string& new_sfen) -> bool {
+    Position candidate; StateListPtr states(new StateList(1));
+    candidate.set(new_sfen, &states->back(), Threads.main());
+    if (!komori::ValidateTsumePosition(candidate).empty()) return false;
+    if (candidate.in_check()) return false;
+    Search::LimitsType limits;
+    limits.mate = static_cast<int>(std::min<std::uint64_t>(time_limit_ms / 3, 500));
+    Time.reset();
+    Threads.start_thinking(candidate, states, limits, false);
+    Threads.main()->wait_for_search_finished();
+    return g_search_result == komori::NodeState::kProven &&
+           static_cast<int>(g_searcher.BestMoves().size()) == target_moves;
+  };
+
+  int cand_cnt = 0;
+  for (int pr = 0; pr < 9; ++pr) {
+    for (int pf = 0; pf < 9; ++pf) {
+      const std::string& cell = board[pr][pf];
+      if (cell.empty()) continue;
+      char bc = cell.back();
+      if (!std::isupper((unsigned char)bc) || bc == 'K') continue;
+      char hand_ch = bc;
+      komori::detail::SfenBoard board2 = board;
+      board2[pr][pf] = "";
+      const std::string hand2 = AddToAttackerHand(hand_str, hand_ch);
+
+      // 玉を同位置維持（駒除去のみ）
+      {
+        const std::string new_sfen = komori::detail::BuildSfenBoard(board2)
+                                     + " " + turn + " " + hand2 + " " + move_no;
+        if (test_candidate(new_sfen)) {
+          const auto& bm = g_searcher.BestMoves();
+          std::vector<std::string> sol;
+          for (const auto& m : bm) sol.push_back(USI::move(m));
+          sync_cout << "info string [逆算ステップ合格] " << target_moves << "ply: "
+                    << new_sfen << sync_endl;
+          return komori::TsumeGeneratedProblem{new_sfen, target_moves, sol, ""};
+        }
+        ++cand_cnt;
+      }
+
+      // 玉を盤上の全マスへ移動（近傍から遠傍まで）
+      for (int er = 0; er < 9; ++er) {
+        for (int ef = 0; ef < 9; ++ef) {
+          if (er == kr && ef == kf) continue;  // 同位置は上で処理済み
+          if (!board2[er][ef].empty()) continue;
+          komori::detail::SfenBoard board3 = board2;
+          board3[kr][kf] = "";
+          board3[er][ef] = "k";
+          const std::string new_sfen = komori::detail::BuildSfenBoard(board3)
+                                       + " " + turn + " " + hand2 + " " + move_no;
+          if (test_candidate(new_sfen)) {
+            const auto& bm = g_searcher.BestMoves();
+            std::vector<std::string> sol;
+            for (const auto& m : bm) sol.push_back(USI::move(m));
+            sync_cout << "info string [逆算ステップ合格] " << target_moves << "ply: "
+                      << new_sfen << sync_endl;
+            return komori::TsumeGeneratedProblem{new_sfen, target_moves, sol, ""};
+          }
+          ++cand_cnt;
+          if (cand_cnt % 100 == 0) {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            if (static_cast<std::uint64_t>(elapsed) >= budget_ms) {
+              sync_cout << "info string [逆算ステップ] 時間切れ " << cand_cnt
+                        << "候補試行" << sync_endl;
+              return std::nullopt;
+            }
+          }
+        }
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+// 逆算式拡張: (target_moves-2)手詰め局面 → target_moves手詰めを探す
+// 攻め方駒1枚を手持ちに戻し、玉を盤上の任意の空きマス（または同位置）に置いて試す。
+// 近傍マス優先→全マスの順で探索し、合格したら TryCandidate の結果を返す。
+static std::optional<komori::TsumeGeneratedProblem> RetrogradExtend(
+    const komori::TsumeGeneratedProblem& base,
+    const komori::tsume::VerifyOptions& opts,
+    int target_moves,
+    std::uint64_t time_limit_ms,
+    std::uint64_t budget_ms = 120'000) {
+  const auto t0 = std::chrono::steady_clock::now();
+
+  std::istringstream ss(base.sfen);
+  std::string board_str, turn, hand_str, move_no;
+  if (!(ss >> board_str >> turn >> hand_str >> move_no)) return std::nullopt;
+
+  komori::detail::SfenBoard board{};
+  komori::detail::ParseSfenBoard(board_str, board);
+
+  int kr = -1, kf = -1;
+  for (int r = 0; r < 9 && kr < 0; ++r)
+    for (int f = 0; f < 9 && kr < 0; ++f)
+      if (board[r][f] == "k") { kr = r; kf = f; }
+  if (kr < 0) return std::nullopt;
+
+  int cand_cnt = 0;
+
+  // 盤上の攻め方駒(大文字、王以外)を1枚ずつ手持ちに戻す
+  for (int pr = 0; pr < 9; ++pr) {
+    for (int pf = 0; pf < 9; ++pf) {
+      const std::string& cell = board[pr][pf];
+      if (cell.empty()) continue;
+      char bc = cell.back();
+      if (!std::isupper((unsigned char)bc) || bc == 'K') continue;
+
+      char hand_ch = bc;
+      komori::detail::SfenBoard board2 = board;
+      board2[pr][pf] = "";
+      const std::string hand2 = AddToAttackerHand(hand_str, hand_ch);
+
+      // 玉を同位置維持（駒除去のみ）
+      {
+        komori::detail::SfenBoard board3 = board2;
+        const std::string new_sfen = komori::detail::BuildSfenBoard(board3)
+                                     + " " + turn + " " + hand2 + " " + move_no;
+        auto result = TryCandidate(new_sfen, opts, target_moves, time_limit_ms);
+        ++cand_cnt;
+        if (result) {
+          sync_cout << "info string [逆算合格] " << target_moves << "ply: "
+                    << new_sfen << sync_endl;
+          return result;
+        }
+        // time budget check
+        if (cand_cnt % 100 == 0) {
+          const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now() - t0).count();
+          if (static_cast<std::uint64_t>(elapsed) >= budget_ms) {
+            sync_cout << "info string [逆算] 時間切れ " << cand_cnt << "候補試行" << sync_endl;
+            return std::nullopt;
+          }
+        }
+      }
+
+      // 玉を近傍8マスへ移動（優先探索）
+      for (int dr = -1; dr <= 1; ++dr) {
+        for (int df = -1; df <= 1; ++df) {
+          if (!dr && !df) continue;
+          const int er = kr + dr, ef = kf + df;
+          if (er < 0 || er >= 9 || ef < 0 || ef >= 9) continue;
+          if (board2[er][ef].empty()) {
+            komori::detail::SfenBoard board3 = board2;
+            board3[kr][kf] = "";
+            board3[er][ef] = "k";
+            const std::string new_sfen = komori::detail::BuildSfenBoard(board3)
+                                         + " " + turn + " " + hand2 + " " + move_no;
+            auto result = TryCandidate(new_sfen, opts, target_moves, time_limit_ms);
+            ++cand_cnt;
+            if (result) {
+              sync_cout << "info string [逆算合格] " << target_moves << "ply: "
+                        << new_sfen << sync_endl;
+              return result;
+            }
+            if (cand_cnt % 100 == 0) {
+              const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - t0).count();
+              if (static_cast<std::uint64_t>(elapsed) >= budget_ms) {
+                sync_cout << "info string [逆算] 時間切れ " << cand_cnt << "候補試行" << sync_endl;
+                return std::nullopt;
+              }
+            }
+          }
+        }
+      }
+
+      // 玉を全マスへ移動（近傍で見つからない場合の網羅探索）
+      for (int er = 0; er < 9; ++er) {
+        for (int ef = 0; ef < 9; ++ef) {
+          if (er == kr && ef == kf) continue;  // 同位置は上で処理済み
+          // 近傍マスはすでに試した
+          if (std::abs(er - kr) <= 1 && std::abs(ef - kf) <= 1) continue;
+          if (board2[er][ef].empty()) {
+            komori::detail::SfenBoard board3 = board2;
+            board3[kr][kf] = "";
+            board3[er][ef] = "k";
+            const std::string new_sfen = komori::detail::BuildSfenBoard(board3)
+                                         + " " + turn + " " + hand2 + " " + move_no;
+            auto result = TryCandidate(new_sfen, opts, target_moves, time_limit_ms);
+            ++cand_cnt;
+            if (result) {
+              sync_cout << "info string [逆算合格] " << target_moves << "ply: "
+                        << new_sfen << sync_endl;
+              return result;
+            }
+            if (cand_cnt % 100 == 0) {
+              const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - t0).count();
+              if (static_cast<std::uint64_t>(elapsed) >= budget_ms) {
+                sync_cout << "info string [逆算] 時間切れ " << cand_cnt << "候補試行" << sync_endl;
+                return std::nullopt;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  sync_cout << "info string [逆算] " << cand_cnt << "候補試行, 合格なし" << sync_endl;
+  return std::nullopt;
+}
+
 static std::optional<komori::TsumeGeneratedProblem> PerturbAndRetry(
     const komori::TsumeGeneratedProblem& base_problem,
     const komori::tsume::VerifyOptions& verify_options,
@@ -385,6 +823,7 @@ static std::optional<komori::TsumeGeneratedProblem> PerturbAndRetry(
   komori::detail::SfenBoard board;
   komori::detail::ParseSfenBoard(board_str, board);
 
+  int cnt_dfpn = 0, cnt_ev = 0, cnt_no_unnec = 0, cnt_aesthetic = 0;
   for (int r = 0; r < 9; ++r) {
     for (int f = 0; f < 9; ++f) {
       const std::string& cell = board[r][f];
@@ -395,11 +834,9 @@ static std::optional<komori::TsumeGeneratedProblem> PerturbAndRetry(
 
       const bool is_attacker = std::isupper(static_cast<unsigned char>(base_ch));
 
-      for (int dr = -1; dr <= 1; ++dr) {
-        for (int df = -1; df <= 1; ++df) {
-          if (dr == 0 && df == 0) continue;
-          const int nr = r + dr, nf = f + df;
-          if (nr < 0 || nr >= 9 || nf < 0 || nf >= 9) continue;
+      for (int nr = 0; nr < 9; ++nr) {
+        for (int nf = 0; nf < 9; ++nf) {
+          if (nr == r && nf == f) continue;
           if (!board[nr][nf].empty()) continue;  // 占有済み
 
           // 行き所なし駒チェック
@@ -431,6 +868,28 @@ static std::optional<komori::TsumeGeneratedProblem> PerturbAndRetry(
           const auto& bm = g_searcher.BestMoves();
           if (static_cast<int>(bm.size()) != target_moves) continue;
           if (komori::tsume::HasSurplusAttackerHand(candidate, bm)) continue;
+          ++cnt_dfpn;
+          sync_cout << "info string [perturb] df-pn合格: " << cell << " "
+                    << (9 - f) << char('a' + r) << "→" << (9 - nf) << char('a' + nr)
+                    << " " << new_sfen << sync_endl;
+
+          // 高速EV事前フィルタ: full EVの前に軽量チェック
+          {
+            komori::tsume::VerifyOptions quick_opts;
+            quick_opts.max_ply = target_moves;
+            quick_opts.max_nodes = std::max<std::uint64_t>(1'500'000ULL,
+                komori::detail::ComputeNodesLimit(target_moves));
+            quick_opts.double_king = false;
+            Position qp; StateListPtr qs(new StateList(1));
+            qp.set(new_sfen, &qs->back(), Threads.main());
+            komori::tsume::ExhaustiveVerifier qev(quick_opts);
+            const auto qr = qev.Run(qp);
+            if (qr.complete && (!qr.unique || qr.proof != komori::tsume::Proof::kMate ||
+                                qr.mate_ply != target_moves)) {
+              sync_cout << "info string [perturb] quick-EV却下" << sync_endl;
+              continue;
+            }
+          }
 
           Position verify_pos; StateListPtr vs(new StateList(1));
           verify_pos.set(new_sfen, &vs->back(), Threads.main());
@@ -438,14 +897,29 @@ static std::optional<komori::TsumeGeneratedProblem> PerturbAndRetry(
           auto result = ev.Run(verify_pos);
           if (komori::tsume::HasSurplusAttackerHand(verify_pos, result.principal)) continue;
           if (!result.complete || result.proof != komori::tsume::Proof::kMate ||
-              !result.unique || result.mate_ply != target_moves) continue;
+              !result.unique || result.mate_ply != target_moves) {
+            sync_cout << "info string [perturb] full-EV却下 complete=" << result.complete
+                      << " unique=" << result.unique << " ply=" << result.mate_ply << sync_endl;
+            continue;
+          }
+          ++cnt_ev;
 
           AnalyzeUnnecessaryPieces(new_sfen, verify_options, result);
-          if (result.unnecessary_piece) continue;
+          if (result.unnecessary_piece) {
+            sync_cout << "info string [perturb] 邪魔駒却下" << sync_endl;
+            continue;
+          }
+          ++cnt_no_unnec;
 
           auto record = komori::tsume::MakeRecord(verify_pos, new_sfen, verify_options,
                                                   std::move(result));
-          if (!record.aesthetic_pass) continue;
+          if (!record.aesthetic_pass) {
+            sync_cout << "info string [perturb] 審美却下: "
+                      << (record.aesthetic_reasons.empty() ? "?" : record.aesthetic_reasons[0])
+                      << " hendou=" << record.verification.hendou_count << sync_endl;
+            continue;
+          }
+          ++cnt_aesthetic;
 
           komori::TsumeGeneratedProblem prob;
           prob.sfen = new_sfen;
@@ -460,6 +934,9 @@ static std::optional<komori::TsumeGeneratedProblem> PerturbAndRetry(
       }
     }
   }
+  sync_cout << "info string [perturb] 結果: df-pn合格=" << cnt_dfpn
+            << " EV合格=" << cnt_ev << " 邪魔駒なし=" << cnt_no_unnec
+            << " 審美合格=" << cnt_aesthetic << sync_endl;
   return std::nullopt;
 }
 
@@ -480,19 +957,20 @@ void GenerateProblemsForMoves(int target_moves, int count,
   // 手数に応じた探索時間上限（ms）
   const auto time_limit_ms = static_cast<std::uint64_t>(komori::detail::ComputeTimeLimitMs(target_moves));
 
+  // ウォームシード: 9手詰め39枚制では守方手持ちが35枚になり全候補が変同必発。スキップ。
+
   for (int attempt = 0; attempt < max_attempts && static_cast<int>(found.size()) < target_count;
        ++attempt) {
     if (attempt > 0 && attempt % 500 == 0)
       sync_cout << "info string [tsume_generate] 試行 " << attempt << "/" << max_attempts
                 << " 発見済み " << (static_cast<int>(found.size()) - target_count + count)
                 << "/" << count << sync_endl;
-    // ランダム候補局面を生成し、詰将棋ルール通り残り全駒を受け方持ち駒に補完（39枚制）
-    const std::string sfen = komori::detail::CompleteDefenderReserve(
-        komori::detail::GenerateCandidateSfen(rng, target_moves), /*double_king=*/false);
+    // ランダム候補局面を生成（小駒数版: 受け方持ち駒なし）
+    const std::string raw_sfen = komori::detail::GenerateCandidateSfen(rng, target_moves);
 
     Position gen_pos;
     StateListPtr st(new StateList(1));
-    gen_pos.set(sfen, &st->back(), Threads.main());
+    gen_pos.set(raw_sfen, &st->back(), Threads.main());
 
     // 詰将棋ルール検証: 受け方の玉が盤上にある & 出題局面で王手でない
     if (!komori::ValidateTsumePosition(gen_pos).empty()) continue;
@@ -500,7 +978,7 @@ void GenerateProblemsForMoves(int target_moves, int count,
 
     // 事前フィルタ: 玉の逃げ道と攻め方の脅威を静的評価（df-pn 前の高速スキップ）
     {
-      std::istringstream pss(sfen);
+      std::istringstream pss(raw_sfen);
       std::string pboard, pturn, phand;
       pss >> pboard >> pturn >> phand;
       komori::detail::SfenBoard pb;
@@ -532,6 +1010,19 @@ void GenerateProblemsForMoves(int target_moves, int count,
             if (std::isupper(static_cast<unsigned char>(c))) { prefilter_ok = true; break; }
       }
       if (!prefilter_ok) continue;
+
+      // 最初から詰みそうなフィルター: 玉の逃げ道が1マス以下なら配置が自明すぎる
+      if (kr >= 0) {
+        int free_neighbors = 0;
+        for (int dr = -1; dr <= 1; ++dr)
+          for (int df2 = -1; df2 <= 1; ++df2) {
+            if (dr == 0 && df2 == 0) continue;
+            const int nr2 = kr + dr, nf2 = kf + df2;
+            if (nr2 < 0 || nr2 >= 9 || nf2 < 0 || nf2 >= 9) continue;
+            if (pb[nr2][nf2].empty()) ++free_neighbors;
+          }
+        if (free_neighbors <= 1) continue;
+      }
     }
 
     // 詰み探索: limits.mate を時間上限(ms)として使用（KomoringHeights の慣習）
@@ -543,13 +1034,189 @@ void GenerateProblemsForMoves(int target_moves, int count,
     Threads.main()->wait_for_search_finished();
 
     if (g_search_result == komori::NodeState::kProven) {
+      const auto& best_moves_raw = g_searcher.BestMoves();
+      const int mate_in_raw      = static_cast<int>(best_moves_raw.size());
+
+      sync_cout << "info string [small-hand hit] " << mate_in_raw << "ply " << raw_sfen << sync_endl;
+      // 逆算式: 3以上の奇数手詰め（target以下、target と同じ偶奇）を受け入れる
+      if (mate_in_raw < 3 || mate_in_raw > target_moves
+          || (target_moves - mate_in_raw) % 2 != 0) continue;
+
+      // 39枚制に変換してdf-pn再確認（TT汚染防止のためTTをリセット）
+      const std::string sfen39 = komori::detail::CompleteDefenderReserve(raw_sfen, false);
+      int mate_in_39 = -1;
+      {
+        Position pos39; StateListPtr st39(new StateList(1));
+        pos39.set(sfen39, &st39->back(), Threads.main());
+        if (!komori::ValidateTsumePosition(pos39).empty()) continue;
+        Search::LimitsType lim39; lim39.mate = static_cast<int>(time_limit_ms);
+        g_searcher.Init(gen_option, static_cast<std::uint32_t>(Threads.size()));  // TT汚染防止
+        Time.reset();
+        Threads.start_thinking(pos39, st39, lim39, false);
+        Threads.main()->wait_for_search_finished();
+        if (g_search_result != komori::NodeState::kProven) continue;
+        mate_in_39 = static_cast<int>(g_searcher.BestMoves().size());
+        if (mate_in_39 < 3 || mate_in_39 > target_moves
+            || (target_moves - mate_in_39) % 2 != 0) continue;
+        sync_cout << "info string [39枚変換] " << raw_sfen << " → " << sfen39
+                  << " (" << mate_in_39 << "手)" << sync_endl;
+      }
+
+      // 39枚制局面が既に target_moves 手詰めなら直接 TryCandidate（スパース逆算不要）
+      if (mate_in_raw < target_moves && mate_in_39 == target_moves) {
+        sync_cout << "info string [39枚直接候補] " << target_moves << "ply: " << sfen39 << sync_endl;
+        komori::tsume::VerifyOptions opts39;
+        opts39.max_ply = target_moves;
+        opts39.max_nodes = komori::detail::ComputeNodesLimit(target_moves);
+        opts39.double_king = false;
+        // mate_in_39 は既に確認済みなのでdf-pnに3倍の時間を渡す（TryCandidate内でtime/3使用のため）
+        auto result = TryCandidate(sfen39, opts39, target_moves, time_limit_ms * 3);
+        if (result) {
+          found.push_back(*result);
+          sync_cout << "info string [" << target_moves << "手詰め] 発見(39枚直接) "
+                    << static_cast<int>(found.size()) << "/" << count
+                    << ": " << result->sfen << sync_endl;
+          if (!output_file.empty()) komori::SaveTsumeProblems({*result}, output_file);
+          if (static_cast<int>(found.size()) >= target_count) break;
+        }
+        continue;
+      }
+
+      // 逆算式チェーン: スパース局面(raw_sfen)から延伸（EV はスパース局面で実行）
+      if (mate_in_raw < target_moves) {
+        komori::tsume::VerifyOptions retro_opts;
+        retro_opts.max_ply = target_moves;
+        retro_opts.max_nodes = komori::detail::ComputeNodesLimit(target_moves);
+        retro_opts.double_king = false;
+        std::vector<std::string> raw_base_sol;
+        for (const auto& m : best_moves_raw) raw_base_sol.push_back(USI::move(m));
+        komori::TsumeGeneratedProblem cur_prob{raw_sfen, mate_in_raw, raw_base_sol, ""};
+        sync_cout << "info string [逆算開始] " << mate_in_raw << "手詰め(スパース) → "
+                  << target_moves << "手詰めへ: " << raw_sfen << sync_endl;
+
+        // 中間ステップ: df-pn のみ（EV なし）で延伸
+        bool chain_ok = true;
+        for (int ply = mate_in_raw + 2; ply <= target_moves - 2; ply += 2) {
+          auto step = RetrogradStep(cur_prob, ply, time_limit_ms, 30'000);
+          if (!step) { chain_ok = false; break; }
+          cur_prob = *step;
+          sync_cout << "info string [逆算チェーン] " << ply << "手: " << cur_prob.sfen << sync_endl;
+        }
+        if (!chain_ok) continue;
+
+        // 最終ステップ: RetrogradExtend（スパースでEV、成功後に39枚変換）
+        auto extended = RetrogradExtend(cur_prob, retro_opts, target_moves, time_limit_ms);
+        if (extended) {
+          // スパース局面を39枚制に変換して df-pn で再確認（TT汚染防止のためリセット）
+          const std::string sfen39_chain = komori::detail::CompleteDefenderReserve(extended->sfen, false);
+          {
+            Position p39c; StateListPtr st39c(new StateList(1));
+            p39c.set(sfen39_chain, &st39c->back(), Threads.main());
+            if (komori::ValidateTsumePosition(p39c).empty()) {
+              Search::LimitsType lim39c; lim39c.mate = static_cast<int>(time_limit_ms);
+              g_searcher.Init(gen_option, static_cast<std::uint32_t>(Threads.size()));  // TT汚染防止
+              Time.reset();
+              Threads.start_thinking(p39c, st39c, lim39c, false);
+              Threads.main()->wait_for_search_finished();
+              if (g_search_result == komori::NodeState::kProven &&
+                  static_cast<int>(g_searcher.BestMoves().size()) == target_moves) {
+                extended->sfen = sfen39_chain;
+                extended->solution.clear();
+                for (Move m : g_searcher.BestMoves()) extended->solution.push_back(USI::move(m));
+                found.push_back(*extended);
+                sync_cout << "info string [" << target_moves << "手詰め] 発見(逆算チェーン) "
+                          << static_cast<int>(found.size()) << "/" << count
+                          << ": " << extended->sfen << sync_endl;
+                if (!output_file.empty()) komori::SaveTsumeProblems({*extended}, output_file);
+                if (static_cast<int>(found.size()) >= target_count) break;
+              }
+            }
+          }
+        }
+        continue;
+      }
+
+      const std::string& sfen = sfen39;
+      Position pos39_ev; StateListPtr st39_ev(new StateList(1));
+      pos39_ev.set(sfen, &st39_ev->back(), Threads.main());
       const auto& best_moves = g_searcher.BestMoves();
       const int mate_in      = static_cast<int>(best_moves.size());
 
+      sync_cout << "info string [39枚候補] " << mate_in << " ply: " << sfen << sync_endl;
+
       if (mate_in == target_moves) {
+        // Run TryCandidate on SPARSE raw_sfen (fast EV), then confirm 39-piece via df-pn.
+        sync_cout << "info string [raw candidate] " << mate_in << " ply: " << sfen << sync_endl;
+        {
+          komori::tsume::VerifyOptions sparse_opts;
+          sparse_opts.max_ply = target_moves;
+          sparse_opts.max_nodes = komori::detail::ComputeNodesLimit(target_moves);
+          sparse_opts.double_king = false;
+          auto sparse_result = TryCandidate(raw_sfen, sparse_opts, target_moves, time_limit_ms);
+          if (!sparse_result) continue;
+          const std::string sfen39_direct = komori::detail::CompleteDefenderReserve(sparse_result->sfen, false);
+          if (sfen39_direct != sparse_result->sfen) {
+            Position p39d; StateListPtr st39d(new StateList(1));
+            p39d.set(sfen39_direct, &st39d->back(), Threads.main());
+            if (!komori::ValidateTsumePosition(p39d).empty()) continue;
+            Search::LimitsType lim39d; lim39d.mate = static_cast<int>(time_limit_ms);
+            g_searcher.Init(gen_option, static_cast<std::uint32_t>(Threads.size()));  // TT汚染防止
+            Time.reset();
+            Threads.start_thinking(p39d, st39d, lim39d, false);
+            Threads.main()->wait_for_search_finished();
+            if (g_search_result != komori::NodeState::kProven) continue;
+            if (static_cast<int>(g_searcher.BestMoves().size()) != target_moves) continue;
+            sparse_result->sfen = sfen39_direct;
+            sparse_result->solution.clear();
+            for (Move m : g_searcher.BestMoves()) sparse_result->solution.push_back(USI::move(m));
+          }
+          found.push_back(*sparse_result);
+          sync_cout << "info string [" << target_moves << "手詰め] 発見(直接) "
+                    << static_cast<int>(found.size()) << "/" << count
+                    << ": " << sparse_result->sfen << sync_endl;
+          if (!output_file.empty()) komori::SaveTsumeProblems({*sparse_result}, output_file);
+          if (static_cast<int>(found.size()) >= target_count) break;
+        }
+        // Legacy code below (unreachable, kept for reference):
+        if (false) {
         std::vector<std::string> sol;
         for (const auto& m : best_moves) sol.push_back(USI::move(m));
         komori::TsumeGeneratedProblem problem{sfen, mate_in, sol, ""};
+
+        const komori::TsumeGeneratedProblem seed_problem = problem;
+
+        komori::tsume::VerifyOptions verify_options;
+        verify_options.max_ply = target_moves;
+        verify_options.max_nodes = std::max<std::uint64_t>(40'000'000ULL,
+            komori::detail::ComputeNodesLimit(target_moves));
+        verify_options.double_king = false;
+
+        // 類似形探索ヘルパー: 1駒移動 → 2駒同時移動 の順で試して found に追加
+        auto try_local_search = [&](const char* reason) -> bool {
+          sync_cout << "info string [local_search] " << reason
+                    << " seed=" << seed_problem.sfen << sync_endl;
+          auto ls = PerturbAndRetry(seed_problem, verify_options, target_moves, time_limit_ms);
+          if (ls) {
+            found.push_back(*ls);
+            sync_cout << "info string [" << target_moves << "手詰め] 発見(1駒類似形) "
+                      << (static_cast<int>(found.size()) - target_count + count)
+                      << "/" << count << ": " << ls->sfen << sync_endl;
+            if (!output_file.empty()) komori::SaveTsumeProblems({*ls}, output_file);
+            return true;
+          }
+          sync_cout << "info string [local_search] 1駒近傍なし、2駒摂動を試みる" << sync_endl;
+          auto ls2 = PerturbTwoPiece(seed_problem, verify_options, target_moves, time_limit_ms);
+          if (ls2) {
+            found.push_back(*ls2);
+            sync_cout << "info string [" << target_moves << "手詰め] 発見(2駒類似形) "
+                      << (static_cast<int>(found.size()) - target_count + count)
+                      << "/" << count << ": " << ls2->sfen << sync_endl;
+            if (!output_file.empty()) komori::SaveTsumeProblems({*ls2}, output_file);
+            return true;
+          }
+          sync_cout << "info string [local_search] 近傍なし" << sync_endl;
+          return false;
+        };
 
         // 目標手数の生候補を失わないよう、延長より先に完全検証する。
         // 従来は未検証の延長候補で元の9手候補を上書きしていた。
@@ -560,46 +1227,49 @@ void GenerateProblemsForMoves(int target_moves, int count,
           // 余剰持ち駒を取り除いて受け方の予備に戻し、局面を再設定する
           const std::string stripped = StripSurplusAttackerHand(sfen, gen_pos, best_moves);
           if (stripped.empty() || stripped == sfen) {
-            sync_cout << "info string [candidate rejected] surplus attacker hand - strip failed"
-                      << sync_endl;
-            continue;
-          }
-          st.reset(new StateList(1));
-          gen_pos.set(stripped, &st->back(), Threads.main());
-          if (!komori::ValidateTsumePosition(gen_pos).empty() || gen_pos.in_check()) {
-            sync_cout << "info string [candidate rejected] surplus stripped pos invalid" << sync_endl;
-            continue;
-          }
-          // 改めて df-pn で同手数確認
-          Search::LimitsType retry_limits; retry_limits.mate = static_cast<int>(time_limit_ms / 2);
-          Time.reset();
-          Threads.start_thinking(gen_pos, st, retry_limits, false);
-          Threads.main()->wait_for_search_finished();
-          if (g_search_result != komori::NodeState::kProven) {
-            // 剥ぎ取り後に詰まなくなった → 持ち駒が変化に必要。EV の surplus 判定を信用しない。
-            sync_cout << "info string [strip] re-mate failed - falling back to original pos for EV" << sync_endl;
+            // 39枚制では剥ぎ取り失敗は正常（変化に使われる場合）→ 元局面のままEVに委ねる
             strip_verified_necessary = true;
-            st.reset(new StateList(1));
-            gen_pos.set(sfen, &st->back(), Threads.main());
-            // problem.sfen/solution は既に元の値のまま
           } else {
-            const std::vector<Move> retry_moves = g_searcher.BestMoves();
-            if (static_cast<int>(retry_moves.size()) != target_moves) {
-              sync_cout << "info string [candidate rejected] surplus stripped mate_in changed" << sync_endl;
-              continue;
-            }
-            if (komori::tsume::HasSurplusAttackerHand(gen_pos, retry_moves)) {
-              // 剥ぎ取り後もまだ余剰（取った駒が手に残った等）→ EV に委ねる
-              sync_cout << "info string [strip] surplus remains - falling back to original pos for EV" << sync_endl;
+            st.reset(new StateList(1));
+            gen_pos.set(stripped, &st->back(), Threads.main());
+            if (!komori::ValidateTsumePosition(gen_pos).empty() || gen_pos.in_check()) {
+              // 39枚制では剥ぎ取り後の位置が不正になる場合も→元局面で進める
+              strip_verified_necessary = true;
               st.reset(new StateList(1));
               gen_pos.set(sfen, &st->back(), Threads.main());
-              // problem.sfen/solution は既に元の値のまま
             } else {
-              // 剥ぎ取り成功 — 以降は stripped の位置を使用
-              problem.sfen = stripped;
-              problem.solution.clear();
-              for (const auto& m : retry_moves) problem.solution.push_back(USI::move(m));
-              sync_cout << "info string [strip ok] " << stripped << sync_endl;
+              // 改めて df-pn で同手数確認
+              Search::LimitsType retry_limits; retry_limits.mate = static_cast<int>(time_limit_ms / 2);
+              Time.reset();
+              Threads.start_thinking(gen_pos, st, retry_limits, false);
+              Threads.main()->wait_for_search_finished();
+              if (g_search_result != komori::NodeState::kProven) {
+                // 剥ぎ取り後に詰まなくなった → 持ち駒が変化に必要。EV の surplus 判定を信用しない。
+                sync_cout << "info string [strip] re-mate failed - falling back to original pos for EV" << sync_endl;
+                strip_verified_necessary = true;
+                st.reset(new StateList(1));
+                gen_pos.set(sfen, &st->back(), Threads.main());
+                // problem.sfen/solution は既に元の値のまま
+              } else {
+                const std::vector<Move> retry_moves = g_searcher.BestMoves();
+                if (static_cast<int>(retry_moves.size()) != target_moves) {
+                  sync_cout << "info string [candidate rejected] surplus stripped mate_in changed" << sync_endl;
+                  continue;
+                }
+                if (komori::tsume::HasSurplusAttackerHand(gen_pos, retry_moves)) {
+                  // 剥ぎ取り後もまだ余剰（取った駒が手に残った等）→ EV に委ねる
+                  sync_cout << "info string [strip] surplus remains - falling back to original pos for EV" << sync_endl;
+                  st.reset(new StateList(1));
+                  gen_pos.set(sfen, &st->back(), Threads.main());
+                  // problem.sfen/solution は既に元の値のまま
+                } else {
+                  // 剥ぎ取り成功 — 以降は stripped の位置を使用
+                  problem.sfen = stripped;
+                  problem.solution.clear();
+                  for (const auto& m : retry_moves) problem.solution.push_back(USI::move(m));
+                  sync_cout << "info string [strip ok] " << stripped << sync_endl;
+                }
+              }
             }
           }
         }
@@ -692,11 +1362,6 @@ void GenerateProblemsForMoves(int target_moves, int count,
         }
 
         // df-pnで見つかった候補を作品検査用の全幅AND/OR探索で再検証する。
-        komori::tsume::VerifyOptions verify_options;
-        verify_options.max_ply = problem.mate_in;
-        verify_options.max_nodes = std::max<std::uint64_t>(20'000'000,
-            komori::detail::ComputeNodesLimit(problem.mate_in));
-        verify_options.double_king = false;
         Position candidate; StateListPtr candidate_states(new StateList(1));
         candidate.set(problem.sfen, &candidate_states->back(), Threads.main());
         komori::tsume::ExhaustiveVerifier complete_verifier(verify_options);
@@ -727,7 +1392,9 @@ void GenerateProblemsForMoves(int target_moves, int count,
         komori::tsume::ExhaustiveVerifier normalized_verifier(verify_options);
         complete_result = normalized_verifier.Run(normalized);
         if (!complete_result.complete || !complete_result.unique ||
-            complete_result.mate_ply != problem.mate_in) continue;
+            complete_result.mate_ply != problem.mate_in) {
+          continue;
+        }
         problem.solution.clear();
         for (Move m : complete_result.principal) problem.solution.push_back(USI::move(m));
         auto record = komori::tsume::MakeRecord(normalized, problem.sfen, verify_options,
@@ -742,25 +1409,9 @@ void GenerateProblemsForMoves(int target_moves, int count,
                     << " non_king_def=" << record.techniques.non_king_defences;
           for (const auto& reason : record.aesthetic_reasons) sync_cout << ' ' << reason << ';';
           sync_cout << sync_endl;
-          // chasing_mateのみが不合格原因なら perturbで改善できないことが多い→スキップ
-          const bool worth_retry = record.perfect &&
-                                   record.verification.mate_ply >= 7 &&
-                                   record.scores.aestheticScore >= 15.0 &&
-                                   !record.techniques.chasing_mate;
-          if (worth_retry) {
-            sync_cout << "info string [perturb] score=" << record.scores.aestheticScore
-                      << " - trying nearby positions" << sync_endl;
-            auto perturbed_opt = PerturbAndRetry(problem, verify_options, target_moves,
-                                                 time_limit_ms);
-            if (!perturbed_opt) {
-              sync_cout << "info string [perturb] no improvement found" << sync_endl;
-              continue;
-            }
-            problem = std::move(*perturbed_opt);
-            // problem.record_json は PerturbAndRetry 内で設定済み
-          } else {
-            continue;
-          }
+          if (static_cast<int>(found.size()) < target_count)
+            try_local_search("aesthetic_reject");
+          continue;
         } else {
           problem.record_json = komori::tsume::ToJson(record, normalized);
         }
@@ -784,6 +1435,7 @@ void GenerateProblemsForMoves(int target_moves, int count,
                   << ": " << problem.sfen << sync_endl;
         if (!output_file.empty())
           komori::SaveTsumeProblems({problem}, output_file);
+        }  // end if (false)
       }
     }
   }

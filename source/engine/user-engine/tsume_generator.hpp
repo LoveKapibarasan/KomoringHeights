@@ -83,6 +83,7 @@ inline std::uint64_t ComputeTimeLimitMs(int target_moves) {
 inline int ComputeMaxPieces(int target_moves) {
   if (target_moves <= 3)  return 2;
   if (target_moves <= 7)  return 3;
+  if (target_moves <= 9)  return 9;   // 逆算式: 制限なし
   if (target_moves <= 15) return 4;
   if (target_moves <= 25) return 5;
   return 6;
@@ -144,9 +145,10 @@ inline std::string GenerateCandidateSfen(std::mt19937& rng, int target_moves = 3
   const int king_file = edge_bias(rng) ? static_cast<int>(rng() % 3) : file_dist(rng);
   board[king_rank][king_file] = 'k';
 
-  // 目標手数に応じた攻め方の駒数
+  // 目標手数に応じた攻め方の駒数（逆算式のため少ない駒数で3手詰めベースを狙う）
   const int max_pieces = ComputeMaxPieces(target_moves);
-  std::uniform_int_distribution<int> num_pieces_dist(1, max_pieces);
+  const int min_pieces = 1;
+  std::uniform_int_distribution<int> num_pieces_dist(min_pieces, max_pieces);
   const int num_pieces = num_pieces_dist(rng);
 
   std::uniform_int_distribution<int> piece_type_dist(0, static_cast<int>(kPieceChars.size()) - 1);
@@ -221,7 +223,8 @@ inline std::string GenerateCandidateSfen(std::mt19937& rng, int target_moves = 3
   // These pieces are part of the same random construction (not a library seed)
   // and are charged against the physical 39-piece set below.
   const int max_defenders = target_moves >= 7 ? 3 : 1;
-  std::uniform_int_distribution<int> defender_count_dist(0, max_defenders);
+  const int min_defenders = 0;
+  std::uniform_int_distribution<int> defender_count_dist(min_defenders, max_defenders);
   std::uniform_int_distribution<int> defender_type_dist(0, 4);  // P,L,N,S,G
   const int defender_count = defender_count_dist(rng);
   for (int i = 0; i < defender_count; ++i) {
@@ -243,6 +246,12 @@ inline std::string GenerateCandidateSfen(std::mt19937& rng, int target_moves = 3
       // remain on ranks 8 or 9.
       if ((piece == 'p' || piece == 'l') && r == 8) continue;
       if (piece == 'n' && r >= 7) continue;
+      // 二歩チェック: 後手歩は同筋にすでに歩があれば配置不可
+      if (piece == 'p') {
+        bool nifu = false;
+        for (int rr = 0; rr < 9; ++rr) if (board[rr][f] == 'p') { nifu = true; break; }
+        if (nifu) continue;
+      }
       board[r][f] = piece;
       placed = true;
     }
@@ -331,25 +340,35 @@ inline std::string CompleteDefenderReserve(const std::string& sfen, bool double_
     if (std::toupper(static_cast<unsigned char>(c)) == 'K') ++kings;
     else if (int i = index_of(c); i >= 0) ++used[i];
   }
+  // 攻め方の持ち駒（大文字）を保持し、受け方持ち駒は再計算して正規化する
+  std::array<int, 7> attacker_hand_count{};
   if (hands != "-") {
     int count = 0;
     for (char c : hands) {
       if (std::isdigit(static_cast<unsigned char>(c))) { count = count * 10 + c - '0'; continue; }
-      if (int i = index_of(c); i >= 0) used[i] += count ? count : 1;
-      count = 0;
+      const int n = count ? count : 1; count = 0;
+      if (int i = index_of(c); i >= 0) {
+        used[i] += n;
+        if (std::isupper(static_cast<unsigned char>(c))) attacker_hand_count[i] += n;
+      }
     }
-  } else hands.clear();
+  }
   // A single-king composition uses 39 pieces; double-king uses all 40.
   const int expected_kings = double_king ? 2 : 1;
   if (kings != expected_kings) return sfen;
+  // 攻め方持ち駒（大文字）を先に出力、次に残り全駒を受け方持ち駒として出力
+  std::string new_hands;
+  for (int i = 0; i < 7; ++i) {
+    if (attacker_hand_count[i] > 1) new_hands += std::to_string(attacker_hand_count[i]);
+    if (attacker_hand_count[i] > 0) new_hands += kPieceChars[i];
+  }
   for (int i = 0; i < 7; ++i) {
     const int remaining = kPieceMaxTotal[i] - used[i];
-    if (remaining < 0) return sfen;  // invalid material; Position validation reports it later
-    if (remaining > 1) hands += std::to_string(remaining);
-    hands += remaining ? static_cast<char>(std::tolower(static_cast<unsigned char>(kPieceChars[i]))) : '\0';
-    if (!hands.empty() && hands.back() == '\0') hands.pop_back();
+    if (remaining < 0) return sfen;  // invalid material
+    if (remaining > 1) new_hands += std::to_string(remaining);
+    if (remaining > 0) new_hands += static_cast<char>(std::tolower(static_cast<unsigned char>(kPieceChars[i])));
   }
-  return board_text + " " + turn + " " + (hands.empty() ? "-" : hands) + " " + move_no;
+  return board_text + " " + turn + " " + (new_hands.empty() ? "-" : new_hands) + " " + move_no;
 }
 
 inline SfenBoard TransformBoard(const SfenBoard& b, bool flip, int sf, int sr) {
