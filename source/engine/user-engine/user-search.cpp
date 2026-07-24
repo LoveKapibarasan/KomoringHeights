@@ -919,6 +919,42 @@ static std::optional<komori::TsumeGeneratedProblem> RetrogradExtend(
     }
   }
 
+  // 攻め方盤上駒を別マスに移動（reposition）して target_moves 手詰めを探す
+  // 駒除去とは異なり攻め方の戦力は変わらない（配置のみ変更）
+  for (int pr = 0; pr < 9; ++pr) {
+    for (int pf = 0; pf < 9; ++pf) {
+      const std::string& cell = board[pr][pf];
+      if (cell.empty()) continue;
+      char bc = cell.back();
+      if (!std::isupper((unsigned char)bc) || bc == 'K') continue;
+
+      komori::detail::SfenBoard board2 = board;
+      board2[pr][pf] = "";
+
+      // 移動先: 王から4マス以内に優先して配置（遠距離移動は攻撃力が変わりすぎる）
+      for (int nr = std::max(0, kr - 4); nr <= std::min(8, kr + 4); ++nr) {
+        for (int nf = std::max(0, kf - 4); nf <= std::min(8, kf + 4); ++nf) {
+          if (nr == pr && nf == pf) continue;
+          if (!board2[nr][nf].empty()) continue;
+          if (!komori::detail::IsValidBoardPlacement(bc, nr)) continue;
+
+          komori::detail::SfenBoard board3 = board2;
+          board3[nr][nf] = cell;
+          const std::string sparse = komori::detail::BuildSfenBoard(board3)
+                                     + " " + turn + " " + hand_str + " " + move_no;
+          auto result = try_39(sparse);
+          ++cand_cnt;
+          if (result) {
+            sync_cout << "info string [逆算合格(駒移動)] " << target_moves << "ply: "
+                      << result->sfen << sync_endl;
+            return result;
+          }
+          if (!check_budget()) return std::nullopt;
+        }
+      }
+    }
+  }
+
   sync_cout << "info string [逆算] " << cand_cnt << "候補試行, 合格なし" << sync_endl;
   return std::nullopt;
 }

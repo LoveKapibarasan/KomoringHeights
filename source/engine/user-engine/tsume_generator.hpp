@@ -139,12 +139,24 @@ inline std::string GenerateCandidateSfen(std::mt19937& rng, int target_moves = 3
   std::uniform_int_distribution<int> rank_dist(0, 8);
   std::uniform_int_distribution<int> file_dist(0, 8);
 
-  // Edge kings produce substantially more composition-like mating nets than
-  // uniform full-board sampling. Keep a minority of central positions so the
-  // generator is not restricted to corner templates.
-  std::bernoulli_distribution edge_bias(0.75);
-  const int king_rank = edge_bias(rng) ? static_cast<int>(rng() % 3) : rank_dist(rng);
-  const int king_file = edge_bias(rng) ? static_cast<int>(rng() % 3) : file_dist(rng);
+  // 9手詰めは逃げ道が必要なため、玉を上段（1-4段目）・任意筋に配置する。
+  // 3手詰め以下は端玉が有効なため左右端列にもバイアス。
+  const int king_rank = [&]() {
+    if (target_moves >= 9) {
+      // 上4段（rank 0-3）に60%のバイアス（逃げ道を確保）
+      std::bernoulli_distribution top_bias(0.60);
+      return top_bias(rng) ? static_cast<int>(rng() % 4) : rank_dist(rng);
+    }
+    std::bernoulli_distribution edge_bias(0.75);
+    return edge_bias(rng) ? static_cast<int>(rng() % 3) : rank_dist(rng);
+  }();
+  const int king_file = [&]() {
+    if (target_moves >= 9) {
+      return file_dist(rng);  // 9手以上: 筋バイアスなし（逃げ道を横方向に確保）
+    }
+    std::bernoulli_distribution edge_bias(0.75);
+    return edge_bias(rng) ? static_cast<int>(rng() % 3) : file_dist(rng);
+  }();
   board[king_rank][king_file] = 'k';
 
   // 目標手数に応じた攻め方の駒数
@@ -164,6 +176,9 @@ inline std::string GenerateCandidateSfen(std::mt19937& rng, int target_moves = 3
   // 大駒（飛・角）は1枚まで: 複数あると非限定詰みになりやすい
   int major_pieces_used = 0;
   static constexpr int kMaxMajorPieces = 1;  // B=index5, R=index6
+  // 金は1枚まで: 複数金は変同（複数解）の主原因
+  int gold_used = 0;
+  static constexpr int kMaxGold = 1;  // G=index4
 
   for (int i = 0; i < num_pieces; ++i) {
     // 使用可能枚数が残っている駒種を選択
@@ -174,6 +189,8 @@ inline std::string GenerateCandidateSfen(std::mt19937& rng, int target_moves = 3
         // 大駒制限
         const bool is_major = (idx == 5 || idx == 6);  // B=index5, R=index6
         if (is_major && major_pieces_used >= kMaxMajorPieces) continue;
+        // 金制限
+        if (idx == 4 && gold_used >= kMaxGold) continue;
         piece_idx = idx;
         break;
       }
@@ -228,6 +245,7 @@ inline std::string GenerateCandidateSfen(std::mt19937& rng, int target_moves = 3
 
     ++used_count[piece_idx];
     if (piece_idx == 5 || piece_idx == 6) ++major_pieces_used;
+    if (piece_idx == 4) ++gold_used;
   }
 
   // Add a small number of generated defender pieces around the king.  Purely
