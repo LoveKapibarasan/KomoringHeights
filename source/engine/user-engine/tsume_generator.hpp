@@ -56,7 +56,8 @@ inline constexpr std::array<int, 7>  kPieceMaxTotal = {18, 4, 4, 4, 4, 2, 2};
  */
 inline std::uint64_t ComputeNodesLimit(int target_moves) {
   if (target_moves <= 5)  return    500'000ULL;
-  if (target_moves <= 11) return  1'500'000ULL;
+  if (target_moves <= 9)  return  5'000'000ULL;  // 9手: 受け方予備駒多く EV が重い
+  if (target_moves <= 11) return  3'000'000ULL;
   if (target_moves <= 21) return  4'000'000ULL;
   if (target_moves <= 31) return 12'000'000ULL;
   return 25'000'000ULL;
@@ -69,6 +70,7 @@ inline std::uint64_t ComputeNodesLimit(int target_moves) {
  */
 inline std::uint64_t ComputeTimeLimitMs(int target_moves) {
   if (target_moves <= 5)  return    500ULL;
+  if (target_moves <= 9)  return  4'000ULL;  // 9手: EV に余裕を持たせる
   if (target_moves <= 11) return  1'500ULL;
   if (target_moves <= 21) return  4'000ULL;
   if (target_moves <= 31) return 12'000ULL;
@@ -83,7 +85,7 @@ inline std::uint64_t ComputeTimeLimitMs(int target_moves) {
 inline int ComputeMaxPieces(int target_moves) {
   if (target_moves <= 3)  return 2;
   if (target_moves <= 7)  return 3;
-  if (target_moves <= 9)  return 9;   // 逆算式: 制限なし
+  if (target_moves <= 9)  return 5;   // 9手: 4-5駒で構造的制約を確保（少なすぎると逆算失敗）
   if (target_moves <= 15) return 4;
   if (target_moves <= 25) return 5;
   return 6;
@@ -145,9 +147,9 @@ inline std::string GenerateCandidateSfen(std::mt19937& rng, int target_moves = 3
   const int king_file = edge_bias(rng) ? static_cast<int>(rng() % 3) : file_dist(rng);
   board[king_rank][king_file] = 'k';
 
-  // 目標手数に応じた攻め方の駒数（逆算式のため少ない駒数で3手詰めベースを狙う）
+  // 目標手数に応じた攻め方の駒数
   const int max_pieces = ComputeMaxPieces(target_moves);
-  const int min_pieces = 1;
+  const int min_pieces = (target_moves >= 9) ? 2 : 1;  // 9手以上は最低2駒
   std::uniform_int_distribution<int> num_pieces_dist(min_pieces, max_pieces);
   const int num_pieces = num_pieces_dist(rng);
 
@@ -189,10 +191,21 @@ inline std::string GenerateCandidateSfen(std::mt19937& rng, int target_moves = 3
 
     if (place_on_board) {
       // 盤上に配置できるマスを探す
+      // 王の近傍に配置しやすくする（詰将棋では攻め方が王に迫る構造が多い）
+      std::bernoulli_distribution near_king_bias(0.65);
+      const bool use_near_king = near_king_bias(rng);
       bool placed = false;
       for (int attempt = 0; attempt < 50 && !placed; ++attempt) {
-        const int r = rank_dist(rng);
-        const int f = file_dist(rng);
+        int r, f;
+        if (use_near_king) {
+          // 王から最大4マス以内にバイアス
+          const int spread = (target_moves >= 9) ? 3 : 4;
+          r = std::max(0, std::min(8, king_rank + static_cast<int>(rng() % (2*spread+1)) - spread));
+          f = std::max(0, std::min(8, king_file + static_cast<int>(rng() % (2*spread+1)) - spread));
+        } else {
+          r = rank_dist(rng);
+          f = file_dist(rng);
+        }
 
         if (board[r][f] != '.') continue;
         if (!IsValidBoardPlacement(piece, r)) continue;
@@ -369,6 +382,67 @@ inline std::string CompleteDefenderReserve(const std::string& sfen, bool double_
     if (remaining > 0) new_hands += static_cast<char>(std::tolower(static_cast<unsigned char>(kPieceChars[i])));
   }
   return board_text + " " + turn + " " + (new_hands.empty() ? "-" : new_hands) + " " + move_no;
+}
+
+/// surplus な攻め方手持ち駒（解で一度も使われなかった駒種）を受け方持ち駒へ移す
+/// 返り値: 変更後 SFEN。変更なし or 不正な場合は空文字列
+inline std::string StripSurplusAttackerHand(
+    const std::string& sfen,
+    Position& pos,
+    const std::vector<Move>& solution) {
+  const Color attacker = pos.side_to_move();
+  const Hand initial_hand = pos.hand_of(attacker);
+  if (initial_hand == 0) return {};
+  std::vector<StateInfo> states(solution.size());
+  for (std::size_t i = 0; i < solution.size(); ++i) pos.do_move(solution[i], states[i]);
+  const Hand final_hand = pos.hand_of(attacker);
+  for (auto it = solution.rbegin(); it != solution.rend(); ++it) pos.undo_move(*it);
+
+  // surplus な駒種: final >= initial なら一度も使われていない
+  static constexpr PieceType kPT[] = {PAWN, LANCE, KNIGHT, SILVER, GOLD, BISHOP, ROOK};
+  bool any_surplus = false;
+  for (auto pt : kPT) if (hand_count(final_hand, pt) >= hand_count(initial_hand, pt)) { any_surplus = true; break; }
+  if (!any_surplus) return {};
+
+  // SFEN を解析して手持ち文字列を再構築
+  std::istringstream ss(sfen);
+  std::string bd, tr, hs, mn;
+  if (!(ss >> bd >> tr >> hs >> mn)) return {};
+  std::map<char, int> ahand, dhand;
+  int cnt = 0;
+  for (char c : hs) {
+    if (c == '-') continue;
+    if (std::isdigit((unsigned char)c)) { cnt = cnt * 10 + (c - '0'); continue; }
+    int n = cnt ? cnt : 1; cnt = 0;
+    if (std::isupper((unsigned char)c)) ahand[c] += n;
+    else dhand[(char)std::toupper((unsigned char)c)] += n;
+  }
+  // surplus な駒を受け方手持ちへ移す
+  auto piece_char_upper = [](PieceType pt) -> char {
+    switch (pt) {
+      case PAWN:   return 'P'; case LANCE:  return 'L'; case KNIGHT: return 'N';
+      case SILVER: return 'S'; case GOLD:   return 'G'; case BISHOP: return 'B';
+      case ROOK:   return 'R'; default: return 0;
+    }
+  };
+  bool moved = false;
+  for (auto pt : kPT) {
+    if (hand_count(final_hand, pt) >= hand_count(initial_hand, pt)) {
+      char c = piece_char_upper(pt);
+      int n = ahand[c];
+      if (n > 0) { dhand[c] += n; ahand[c] = 0; moved = true; }
+    }
+  }
+  if (!moved) return {};
+  std::string new_hs;
+  for (char c : {'R','B','G','S','N','L','P'}) {
+    if (ahand[c] > 0) { if (ahand[c] > 1) new_hs += std::to_string(ahand[c]); new_hs += c; }
+  }
+  for (char c : {'R','B','G','S','N','L','P'}) {
+    char lc = (char)std::tolower((unsigned char)c);
+    if (dhand[c] > 0) { if (dhand[c] > 1) new_hs += std::to_string(dhand[c]); new_hs += lc; }
+  }
+  return bd + " " + tr + " " + (new_hs.empty() ? "-" : new_hs) + " " + mn;
 }
 
 inline SfenBoard TransformBoard(const SfenBoard& b, bool flip, int sf, int sr) {
