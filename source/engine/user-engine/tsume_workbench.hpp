@@ -80,6 +80,12 @@ struct AestheticScores {
   double legalityScore{0}, uniquenessScore{0}, lengthScore{0}, complexityScore{0};
   double sacrificeScore{0}, techniqueScore{0}, economyScore{0}, visualScore{0};
   double originalityScore{0}, aestheticScore{0}, totalScore{0};
+  // Raw X-variable values (Hirose 1998) for regression dataset export
+  double x5_spread{0};    // X5: 配置の広さ (bounding box, 0-100)
+  int    x6_count{0};     // X6: 盤上駒数
+  double x7_weighted{0};  // X7: 駒種重み付き平均 (0-100)
+  double x8_ratio{0};     // X8: 駒種数/駒数比率 (0-100)
+  double x10_difficulty{0}; // X10: 探索局面数（難解さ）(0-100)
 };
 
 struct TechniqueSummary {
@@ -87,6 +93,10 @@ struct TechniqueSummary {
   int drops{0}, promotions{0}, non_promotions{0}, discovered_checks{0}, double_checks{0};
   int attacker_moves{0}, contact_checks{0}, defender_moves{0}, defender_king_moves{0};
   int non_king_defences{0};
+  int captures_by_attacker{0};  // X3: 攻め方の駒取り数 (Hirose 1998, negative coefficient)
+  int king_openness{0};         // X4: 詰み局面での玉の開放度 (Hirose 1998, positive) — computed at final position
+  double piece_utilization{0};  // X9: 駒の使用率 (Hirose 1998, positive)
+  int king_final_edge_dist{0};  // X12: 詰み局面での玉の辺からの距離 (Hirose 1998, positive)
   double chase_ratio{0};
   bool chasing_mate{false};
   std::vector<std::string> names;
@@ -453,6 +463,8 @@ class ExhaustiveVerifier {
 inline TechniqueSummary AnalyzeTechniques(Position& pos, const std::vector<Move>& line) {
   TechniqueSummary t;
   std::vector<StateInfo> states(line.size());
+  uint8_t used_types_mask = 0;  // X9: bit i = piece type (i+1) used by attacker
+  const Color attacker_color = pos.side_to_move();  // X2: 不成判定用
   bool previous_sacrifice = false;
   for (std::size_t i = 0; i < line.size(); ++i) {
     const Move m = line[i];
@@ -461,6 +473,23 @@ inline TechniqueSummary AnalyzeTechniques(Position& pos, const std::vector<Move>
       ++t.attacker_moves;
       if (is_drop(m)) ++t.drops;
       if (is_promote(m)) ++t.promotions;
+      // X3: 攻め方の駒取り (非drop移動で行先に駒がある)
+      if (!is_drop(m) && pos.piece_on(to_sq(m)) != NO_PIECE) ++t.captures_by_attacker;
+      // X2: 不成 — 成れる駒が成り区域に入るのに成らない
+      if (!is_drop(m) && !is_promote(m)) {
+        const PieceType rpt = raw_type_of(moved);
+        const bool can_promo = (rpt >= 1 && rpt <= 6);  // PAWN..ROOK (not GOLD, not KING)
+        if (can_promo) {
+          const int to_r  = static_cast<int>(rank_of(to_sq(m)));
+          const int from_r = static_cast<int>(rank_of(from_sq(m)));
+          const bool in_zone = (attacker_color == BLACK) ?
+              (to_r <= 2 || from_r <= 2) : (to_r >= 6 || from_r >= 6);
+          if (in_zone) ++t.non_promotions;
+        }
+      }
+      // X9: 使用駒種を記録
+      const int pt_idx = static_cast<int>(raw_type_of(moved));
+      if (pt_idx >= 1 && pt_idx <= 7) used_types_mask |= static_cast<uint8_t>(1u << (pt_idx - 1));
     } else {
       ++t.defender_moves;
       // KING is encoded outside raw_type_of()'s three-bit unpromoted mask.
@@ -491,6 +520,30 @@ inline TechniqueSummary AnalyzeTechniques(Position& pos, const std::vector<Move>
       else if (!pos.checkers().test(arrival)) ++t.discovered_checks;
     }
   }
+  // ループ後: posは詰み局面 — X4・X12・X9を論文通り詰み局面で計算
+  if (!line.empty()) {
+    // 詰み局面では pos.side_to_move() == 受け方（詰まれた側）
+    const Color mated = pos.side_to_move();
+    const Square ksq = pos.king_square(mated);
+    const int kf = static_cast<int>(file_of(ksq));
+    const int kr = static_cast<int>(rank_of(ksq));
+    // X4: 詰み局面での王の開放度 (論文: 詰み局面で計算)
+    for (int df = -1; df <= 1; ++df) {
+      for (int dr = -1; dr <= 1; ++dr) {
+        if (df == 0 && dr == 0) continue;
+        const int nf = kf + df, nr = kr + dr;
+        if (nf < 0 || nf > 8 || nr < 0 || nr > 8) continue;
+        const Square adj = static_cast<Square>(nf * 9 + nr);
+        const Piece p = pos.piece_on(adj);
+        if (p == NO_PIECE || color_of(p) != mated) ++t.king_openness;
+      }
+    }
+    // X12: 詰み局面での玉の辺からの距離 (中央ほど高得点)
+    t.king_final_edge_dist = std::min({kf, 8 - kf, kr, 8 - kr});
+  }
+  // X9: 駒の使用率 = 使用した駒種数 / 7種
+  t.piece_utilization = static_cast<double>(__builtin_popcount(used_types_mask)) / 7.0;
+
   for (auto it = line.rbegin(); it != line.rend(); ++it) pos.undo_move(*it);
   if (t.sacrifices) t.names.push_back("sacrifice");
   if (t.major_sacrifices) t.names.push_back("major-piece sacrifice");
@@ -536,20 +589,81 @@ inline AestheticScores Score(Position& pos, const VerifyResult& v, const Techniq
   s.legalityScore = v.complete && v.proof == Proof::kMate && !v.prohibited_move ? 100 : 0;
   s.uniquenessScore = v.unique ? 100 : (v.proof == Proof::kMate ? 20 : 0);
   s.lengthScore = std::min(100.0, std::max(0, v.mate_ply) * 5.0);
-  s.complexityScore = std::min(100.0, v.longest_lines.size() * 10.0 +
-                                      t.non_king_defences * 8.0 + t.discovered_checks * 12.0);
+
+  // X5: 配置の広さ (bounding box of board pieces, negative — compact = better)
+  // X6: 駒数 (board piece count, negative)
+  // X7: 駒種重み付き駒数 (negative — valuable idle pieces are wasteful)
+  // X8: 駒数に対する駒種比率 (negative)
+  const int board_pieces = pos.pieces().pop_count();
+  double x5_spread = 0.0;
+  double x7_weighted = 0.0, x8_ratio = 0.0;
+  {
+    // Approximate piece values: P=1, L=3, N=3, S=5, B=8, R=9, G=5
+    static constexpr int kW[] = {0, 1, 3, 3, 5, 8, 9, 5};
+    int min_f = 8, max_f = 0, min_r = 8, max_r = 0;
+    uint8_t type_mask = 0;
+    int w_total = 0;
+    for (int sq = 0; sq < SQ_NB; ++sq) {
+      const Piece p = pos.piece_on(static_cast<Square>(sq));
+      if (p == NO_PIECE) continue;
+      const int f = static_cast<int>(file_of(static_cast<Square>(sq)));
+      const int r = static_cast<int>(rank_of(static_cast<Square>(sq)));
+      min_f = std::min(min_f, f); max_f = std::max(max_f, f);
+      min_r = std::min(min_r, r); max_r = std::max(max_r, r);
+      const int rpt = static_cast<int>(raw_type_of(p));
+      if (rpt >= 1 && rpt <= 7) { w_total += kW[rpt]; type_mask |= static_cast<uint8_t>(1u << (rpt - 1)); }
+    }
+    if (board_pieces > 0) {
+      x5_spread = static_cast<double>((max_f - min_f) * (max_r - min_r)) / 64.0 * 100.0;
+      x7_weighted = static_cast<double>(w_total) / board_pieces * 10.0;  // avg piece value
+      x8_ratio = static_cast<double>(__builtin_popcount(type_mask)) / board_pieces * 100.0;
+    }
+  }
+
+  // X10: 探索局面数 (search difficulty, positive — harder to solve = better)
+  const double x10_difficulty = v.nodes > 0 ?
+      std::min(100.0, std::log2(static_cast<double>(v.nodes)) /
+               std::log2(50'000'000.0) * 100.0) : 0.0;
+
+  // Store raw X values for regression export
+  s.x5_spread = x5_spread;
+  s.x6_count  = board_pieces;
+  s.x7_weighted = x7_weighted;
+  s.x8_ratio  = x8_ratio;
+  s.x10_difficulty = x10_difficulty;
+
+  // X3: 攻め方の駒取りはマイナス評価（追い詰め的で非美的）
+  const double capture_penalty = std::min(50.0, t.captures_by_attacker * 15.0);
+
+  // complexityScore: 変化の多さ + X10（難解さ）- X3（駒取り）
+  s.complexityScore = std::max(0.0, std::min(100.0,
+      static_cast<double>(v.longest_lines.size()) * 10.0 +
+      t.non_king_defences * 8.0 + t.discovered_checks * 12.0 +
+      x10_difficulty * 0.4) - capture_penalty);
+
   s.sacrificeScore = std::min(100.0, t.sacrifices * 18.0 + t.major_sacrifices * 22.0 +
                                       t.consecutive_sacrifices * 12.0);
+
+  // techniqueScore: X1 + X2 + X9 + X11
   s.techniqueScore = std::min(100.0, t.sacrifices * 10.0 + t.major_sacrifices * 18.0 +
                                       t.consecutive_sacrifices * 15.0 +
                                       t.discovered_checks * 18.0 + t.double_checks * 20.0 +
-                                      t.non_king_defences * 4.0);
-  const int board_pieces = pos.pieces().pop_count();
-  s.economyScore = std::max(0.0, 100.0 - std::max(0, board_pieces - 3) * 5.0);
+                                      t.non_king_defences * 4.0 +
+                                      t.non_promotions * 12.0 +       // X2: 不成
+                                      t.piece_utilization * 25.0);    // X9
+
+  // economyScore: X6（駒数少）- X5（配置広い）- X7（重い駒）- X8（種類比率）
+  s.economyScore = std::max(0.0, 100.0 - std::max(0, board_pieces - 3) * 5.0
+                                        - x5_spread * 0.25   // X5 penalty
+                                        - x7_weighted * 0.5  // X7 penalty
+                                        - x8_ratio * 0.15);  // X8 penalty
   if (v.unnecessary_piece) s.economyScore = 0;
-  // Compactness is a deterministic visual proxy; database-aware originality
-  // is intentionally neutral until compared with saved canonical IDs.
-  s.visualScore = std::max(0.0, 85.0 - std::max(0, board_pieces - 8) * 3.0);
+
+  // visualScore: X4（詰み局面の王の開放度）+ X12（玉の位置）
+  s.visualScore = std::min(100.0, std::max(0.0,
+      85.0 - std::max(0, board_pieces - 8) * 3.0 +
+      t.king_openness * 5.0 +         // X4: 詰み局面での開放度（論文通り）
+      t.king_final_edge_dist * 8.0));  // X12: 玉が中央寄りほど高評価
   s.originalityScore = 50;
   s.aestheticScore = (s.lengthScore + s.complexityScore + s.sacrificeScore +
                       s.techniqueScore + s.economyScore + s.visualScore) / 6.0;
@@ -596,6 +710,8 @@ inline WorkRecord MakeRecord(Position& pos, const std::string& normalized_sfen,
       r.techniques.discovered_checks > 0 || r.techniques.double_checks > 0 ||
       r.techniques.non_king_defences > 0;
   if (!meaningful_technique) r.aesthetic_reasons.push_back("no detected thematic technique");
+  if (r.techniques.non_king_defences == 0)
+    r.aesthetic_reasons.push_back("all defender replies are king moves (lure-and-chase pattern)");
   if (r.verification.hendou_count > 0) {
     std::ostringstream hs;
     hs << "hendou (same-move-count alternatives): " << r.verification.hendou_count << " occurrences";
@@ -603,7 +719,8 @@ inline WorkRecord MakeRecord(Position& pos, const std::string& normalized_sfen,
   }
   if (r.scores.aestheticScore < 35.0) r.aesthetic_reasons.push_back("aesthetic score below 35");
   r.aesthetic_pass = r.perfect && r.verification.mate_ply >= 7 && !r.techniques.chasing_mate &&
-                     meaningful_technique && r.scores.aestheticScore >= 35.0;
+                     meaningful_technique && r.techniques.non_king_defences > 0 &&
+                     r.scores.aestheticScore >= 35.0;
   const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
   std::tm tm{};
 #if defined(_WIN32)
@@ -641,7 +758,10 @@ inline void WriteScores(std::ostringstream& o, const AestheticScores& s) {
     << ",\"sacrificeScore\":" << s.sacrificeScore << ",\"techniqueScore\":" << s.techniqueScore
     << ",\"economyScore\":" << s.economyScore << ",\"visualScore\":" << s.visualScore
     << ",\"originalityScore\":" << s.originalityScore << ",\"aestheticScore\":" << s.aestheticScore
-    << ",\"totalScore\":" << s.totalScore;
+    << ",\"totalScore\":" << s.totalScore
+    << ",\"x5Spread\":" << s.x5_spread << ",\"x6Count\":" << s.x6_count
+    << ",\"x7Weighted\":" << s.x7_weighted << ",\"x8Ratio\":" << s.x8_ratio
+    << ",\"x10Difficulty\":" << s.x10_difficulty;
 }
 
 inline std::string ToJson(const WorkRecord& r, Position& root) {
@@ -686,7 +806,12 @@ inline std::string ToJson(const WorkRecord& r, Position& root) {
     << ",\"nonKingDefences\":" << r.techniques.non_king_defences
     << ",\"sacrifices\":" << r.techniques.sacrifices
     << ",\"discoveredChecks\":" << r.techniques.discovered_checks
-    << ",\"doubleChecks\":" << r.techniques.double_checks << "}"
+    << ",\"doubleChecks\":" << r.techniques.double_checks
+    << ",\"capturesByAttacker\":" << r.techniques.captures_by_attacker
+    << ",\"nonPromotions\":" << r.techniques.non_promotions
+    << ",\"kingOpenness\":" << r.techniques.king_openness
+    << ",\"pieceUtilization\":" << r.techniques.piece_utilization
+    << ",\"kingFinalEdgeDist\":" << r.techniques.king_final_edge_dist << "}"
     << ",\"attacks\":[";
   for (std::size_t i = 0; i < r.verification.attacks.size(); ++i) {
     const auto& b = r.verification.attacks[i]; if (i) o << ',';

@@ -56,7 +56,7 @@ inline constexpr std::array<int, 7>  kPieceMaxTotal = {18, 4, 4, 4, 4, 2, 2};
  */
 inline std::uint64_t ComputeNodesLimit(int target_moves) {
   if (target_moves <= 5)  return    500'000ULL;
-  if (target_moves <= 9)  return  5'000'000ULL;  // 9手: 受け方予備駒多く EV が重い
+  if (target_moves <= 9)  return 50'000'000ULL;  // 9手39枚制: 受け方予備駒多くEVノード増加（5倍再試行で250M）
   if (target_moves <= 11) return  3'000'000ULL;
   if (target_moves <= 21) return  4'000'000ULL;
   if (target_moves <= 31) return 12'000'000ULL;
@@ -176,9 +176,9 @@ inline std::string GenerateCandidateSfen(std::mt19937& rng, int target_moves = 3
   // 大駒（飛・角）は1枚まで: 複数あると非限定詰みになりやすい
   int major_pieces_used = 0;
   static constexpr int kMaxMajorPieces = 1;  // B=index5, R=index6
-  // 金は1枚まで: 複数金は変同（複数解）の主原因
+  // 金は2枚まで: 3枚以上は変同の主原因（2枚は離れた役割の場合に有効）
   int gold_used = 0;
-  static constexpr int kMaxGold = 1;  // G=index4
+  static constexpr int kMaxGold = 2;  // G=index4
 
   for (int i = 0; i < num_pieces; ++i) {
     // 使用可能枚数が残っている駒種を選択
@@ -307,6 +307,98 @@ inline std::string GenerateCandidateSfen(std::mt19937& rng, int target_moves = 3
         }
         sfen += c;
       }
+    }
+    if (empty_count > 0) sfen += std::to_string(empty_count);
+  }
+  sfen += " b ";
+  sfen += hand_str.empty() ? "-" : hand_str;
+  sfen += " 1";
+  return sfen;
+}
+
+/**
+ * @brief 9手詰め特化の構造化シード生成（N+S+B_hand パターン）
+ *
+ * 既知の有効パターン: 桂(N)を王の直下(kr+1, kf)、銀(S)を(kr+2, kf±1)、
+ * 角(B)+金(G)を持ち駒。この配置が9手詰め小手合い局面を生みやすい。
+ */
+inline std::string GenerateStructuredSeed9ply(std::mt19937& rng) {
+  std::array<std::array<char, 9>, 9> board{};
+  for (auto& rank : board) rank.fill('.');
+  std::uniform_int_distribution<int> file_dist(0, 8);
+
+  // 王を2-3段目（kr=1,2）に配置：kr=0 では N が行き所なし（桂は2段跳び必須）
+  const int kr = 1 + static_cast<int>(rng() % 2);  // rank 1 or 2
+  // 王はファイル2-6（0-indexed）に配置：端（0,1,7,8）では逃げ場が少なく手数が短くなりすぎる
+  const int kf = 2 + static_cast<int>(rng() % 5);  // file 2-6 (columns 7-3 in USI notation)
+  board[kr][kf] = 'k';
+
+  std::string hand_str;
+
+  // パターン選択（4種）
+  const int pattern = static_cast<int>(rng() % 4);
+
+  if (pattern == 0 || pattern == 1) {
+    // Pattern A: 桂(N)を王の直下 + 銀(S)を2段下・横 + 角(B)+金(G)持ち駒（既知最良構造）
+    // N は王の真下（kr+1, kf）: 桂は2段跳びで kr-1 段目を攻撃 → 王の逃げ先を封じる
+    if (kr + 1 <= 8 && board[kr + 1][kf] == '.') {
+      board[kr + 1][kf] = 'N';
+    }
+    // S は王から2段下・左右どちらか
+    const int sf_delta = (rng() % 2 == 0) ? 1 : -1;
+    const int sf = kf + sf_delta;
+    if (kr + 2 <= 8 && sf >= 0 && sf < 9 && board[kr + 2][sf] == '.') {
+      board[kr + 2][sf] = 'S';
+    } else if (kr + 2 <= 8 && kf >= 0 && board[kr + 2][kf] == '.') {
+      board[kr + 2][kf] = 'S';
+    }
+    // B を持ち駒に（必須）
+    hand_str += 'B';
+    // G を持ち駒に（pattern 0 では必須、pattern 1 では50%確率）
+    if (pattern == 0 || rng() % 2 == 0) { hand_str += 'G'; }
+  } else if (pattern == 2) {
+    // Pattern B: 桂(N)を王の直下 + 金(G)を王の斜め下 + 角(B)持ち駒
+    if (kr + 1 <= 8 && board[kr + 1][kf] == '.') {
+      board[kr + 1][kf] = 'N';
+    }
+    const int gf_delta = (rng() % 2 == 0) ? 1 : -1;
+    const int gf = kf + gf_delta;
+    if (kr + 1 <= 8 && gf >= 0 && gf < 9 && board[kr + 1][gf] == '.') {
+      board[kr + 1][gf] = 'G';
+    } else if (kr + 2 <= 8 && board[kr + 2][kf] == '.') {
+      board[kr + 2][kf] = 'G';
+    }
+    hand_str += 'B';
+    if (rng() % 2 == 0) { hand_str += 'G'; }
+  } else {
+    // Pattern C: 2桂(N)で王の両脇 + 銀(S)を下 + 角(B)+金(G)持ち駒
+    const int nf1 = kf - 1, nf2 = kf + 1;
+    if (kr + 2 <= 8 && nf1 >= 0 && board[kr + 2][nf1] == '.') {
+      board[kr + 2][nf1] = 'N';
+    }
+    if (kr + 2 <= 8 && nf2 < 9 && board[kr + 2][nf2] == '.') {
+      board[kr + 2][nf2] = 'N';
+    }
+    // 銀を追加（任意位置）
+    const int sf_delta = (rng() % 2 == 0) ? 1 : -1;
+    const int sf = kf + sf_delta;
+    if (kr + 1 <= 8 && sf >= 0 && sf < 9 && board[kr + 1][sf] == '.') {
+      board[kr + 1][sf] = 'S';
+    }
+    hand_str += 'B';
+    hand_str += 'G';
+  }
+
+  // SFEN構築
+  std::string sfen;
+  sfen.reserve(80);
+  for (int rank = 0; rank < 9; ++rank) {
+    if (rank > 0) sfen += '/';
+    int empty_count = 0;
+    for (int file = 0; file < 9; ++file) {
+      const char c = board[rank][file];
+      if (c == '.') { ++empty_count; }
+      else { if (empty_count > 0) { sfen += std::to_string(empty_count); empty_count = 0; } sfen += c; }
     }
     if (empty_count > 0) sfen += std::to_string(empty_count);
   }
@@ -548,6 +640,30 @@ inline CanonicalResult CanonicalizePosition(const std::string& sfen,
  * 出力フォーマット（1行1問題）:
  *   sfen <SFEN> ; moves <手順> ; mate_in <手数>
  */
+inline std::vector<TsumeGeneratedProblem> LoadTsumeProblems(const std::string& filename) {
+  std::vector<TsumeGeneratedProblem> result;
+  std::ifstream ifs(filename);
+  if (!ifs) return result;
+  std::string line;
+  while (std::getline(ifs, line)) {
+    if (line.empty() || line.rfind("sfen ", 0) != 0) continue;
+    TsumeGeneratedProblem p;
+    std::istringstream ss(line.substr(5));
+    std::string tok;
+    // SFENは4トークン: board turn hand moveno
+    std::string board, turn, hand, moveno;
+    ss >> board >> turn >> hand >> moveno;
+    p.sfen = board + " " + turn + " " + hand + " " + moveno;
+    while (ss >> tok) {
+      if (tok == ";") continue;
+      if (tok == "moves") { while (ss >> tok) { if (tok == ";") break; p.solution.push_back(tok); } }
+      else if (tok == "mate_in") { ss >> p.mate_in; }
+    }
+    if (!p.sfen.empty()) result.push_back(std::move(p));
+  }
+  return result;
+}
+
 inline void SaveTsumeProblems(const std::vector<TsumeGeneratedProblem>& problems,
                                const std::string& filename) {
   std::ofstream ofs(filename, std::ios::app);
