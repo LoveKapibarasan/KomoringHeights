@@ -274,3 +274,19 @@ comments.md
 
 compile_commands.json
 .cache/
+
+# generation logs & experiment artifacts
+gen_log*.txt
+run_v*.sh
+*.sfen
+*.sfen.jsonl
+tsume_output.*
+source/test_*.sfen*
+source/test_*.jsonl*
+source/600000*
+source/gen_log*.txt
+source/gen_test*.sfen*
+source/tsume_*.sfen*
+
+# MkDocs build output
+site/

@@ -1,0 +1,82 @@
+site_name: KomoringHeights Tsume Wiki
+site_description: 詰将棋自動生成・検証・美的評価エンジンの Wiki
+site_url: https://LoveKapibarasan.github.io/KomoringHeights/
+repo_url: https://github.com/LoveKapibarasan/KomoringHeights
+repo_name: LoveKapibarasan/KomoringHeights
+
+docs_dir: docs/idea
+site_dir: site
+
+theme:
+  name: material
+  language: ja
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - toc.integrate
+    - content.code.copy
+    - search.suggest
+    - search.highlight
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+nav:
+  - Home: index.md
+  - はじめに:
+      - 概要: overview.md
+      - アーキテクチャ: architecture.md
+      - 設計原則: principles.md
+  - 使い方:
+      - USI コマンド: mode.md
+      - ビルドと開発: how-to-develop.md
+  - 内部仕様:
+      - 生成アルゴリズム: flow.md
+      - 検証と美的評価: verification.md
+      - JSON 出力仕様: json-format.md
+  - リファレンス:
+      - 詰将棋モード: tsume-mode.md
+      - 詰将棋生成の審美方針: tsume-aesthetic-policy.md
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+
+plugins:
+  - search:
+      lang:
+        - ja
+        - en
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/LoveKapibarasan/KomoringHeights
